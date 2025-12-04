@@ -8,7 +8,7 @@ include $(INCLUDE_DIR)/package.mk
  
 define Package/sqm-scripts-nss
   TITLE:=SQM scripts for NSS enabled builds
-  DEPENDS:=+sqm-scripts +jsonfilter
+  DEPENDS:=+sqm-scripts +jsonfilter +perl +perlbase-file +perlbase-getopt +perlbase-time +perlbase-threads +ip-full +tc-full +iputils-ping +logrotate +procps-ng +coreutils +procd
   PKGARCH:=all
   SECTION:=base
 endef
