@@ -2,13 +2,28 @@
 # sqm-status: Manage and inspect sqm-autorate
 # Shows service state, active/default profile, uptime, log size, and recent logs
 # Allows toggling logging, log rotation, live streaming, manual clearing, verbosity levels, and combined disable/enable
+# New option: "current" prints only the active profile name
 
-CONF=$(readlink -f /etc/sqm-autorate.conf 2>/dev/null || echo /etc/sqm-autorate.conf)
+CONF=$(readlink -f /var/sqm-autorate.conf 2>/dev/null || echo /var/sqm-autorate.conf)
 LOGFILE=/var/log/sqm-autorate.log
 SERVICE=/etc/init.d/sqm-autorate
 DEFAULT_FILE=/etc/sqm-default
 
 case "$1" in
+  current)
+    if [ -L "$CONF" ]; then
+        ACTIVE_PATH=$(readlink -f "$CONF")
+    else
+        ACTIVE_PATH="$CONF"
+    fi
+    if [ -f "$ACTIVE_PATH" ]; then
+        ACTIVE_PROFILE=$(basename "$ACTIVE_PATH" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
+        echo "Active profile: $ACTIVE_PROFILE"
+    else
+        echo "No active profile config found"
+    fi
+    exit 0
+    ;;
   log-on)
     sed -i '/^log_enabled=/c\log_enabled=1' "$CONF" 2>/dev/null || echo "log_enabled=1" >> "$CONF"
     echo "Logging enabled"
@@ -175,8 +190,10 @@ fi
 
 echo
 echo "=== SUMMARY ==="
-PROFILE=$(cat $DEFAULT_FILE 2>/dev/null || echo "unknown")
-echo "Profile: $PROFILE"
+SUMMARY_DEFAULT=$(cat $DEFAULT_FILE 2>/dev/null || echo "unknown")
+SUMMARY_ACTIVE=$(basename "$(readlink -f $CONF)" | sed 's/sqm-autorate-\(.*\)\.conf/\1/')
+echo "Default profile: $SUMMARY_DEFAULT"
+echo "Active profile: $SUMMARY_ACTIVE"
 LOGGING=$(grep -q '^log_enabled=1' $CONF 2>/dev/null && echo ENABLED || echo DISABLED)
 echo "Logging: $LOGGING"
 echo "Verbosity: $VERBOSITY"

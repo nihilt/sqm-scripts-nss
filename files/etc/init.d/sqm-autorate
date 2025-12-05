@@ -3,26 +3,33 @@
 
 START=95
 STOP=10
-REQUIRE="sqm"   # ensures autorate starts after SQM and stops with it
+REQUIRE="sqm"
 USE_PROCD=1
 
 SCRIPT=/usr/bin/sqm-autorate.pl
-CONFIG=/etc/sqm-autorate.conf
+CONFIG=/var/sqm-autorate.conf        # runtime symlink target
 PIDFILE=/var/run/sqm-autorate.pid
 LOGFILE=/var/log/sqm-autorate.log
 
-EXTRA_COMMANDS="status reload"
-EXTRA_HELP="        status          Show if sqm-autorate is running
-        reload          Reload configuration without full restart"
+EXTRA_COMMANDS="status"
+EXTRA_HELP="        status          Show if sqm-autorate is running"
 
-# --- Helper: load default profile directly ---
-load_default_profile() {
+# --- Helper: ensure active symlink ---
+ensure_active_symlink() {
     DEFAULT_FILE=/etc/sqm-default
     CONF_DIR=/etc/sqm-profiles
     ACTIVE=$CONFIG
 
+    # Respect existing symlink or file
+    if [ -L "$ACTIVE" ] || [ -f "$ACTIVE" ]; then
+        current=$(readlink -f "$ACTIVE" 2>/dev/null || echo "$ACTIVE")
+        echo "sqm-autorate: using existing active config: $current"
+        return 0
+    fi
+
+    # Otherwise create from default marker
     if [ -f "$DEFAULT_FILE" ]; then
-        PROFILE=$(cat "$DEFAULT_FILE")
+        PROFILE=$(cat "$DEFAULT_FILE" | tr -d ' \t\r\n')
         TARGET="$CONF_DIR/sqm-autorate-$PROFILE.conf"
 
         if [ -f "$TARGET" ]; then
@@ -31,28 +38,26 @@ load_default_profile() {
         else
             echo "sqm-autorate: default profile '$PROFILE' not found in $CONF_DIR"
         fi
+    else
+        echo "sqm-autorate: no default marker found ($DEFAULT_FILE)"
     fi
 }
 
-# --- Service triggers: restart autorate when SQM restarts ---
 service_triggers() {
     procd_add_reload_trigger sqm
 }
 
 start_service() {
-    # Ensure SQM service is running
     if ! /etc/init.d/sqm status >/dev/null 2>&1; then
         echo "sqm-autorate: SQM not running, skipping start"
         return 1
     fi
 
-    # Ensure internet connectivity (basic ping test)
     if ! ping -c1 -W1 8.8.8.8 >/dev/null 2>&1; then
         echo "sqm-autorate: no internet connectivity, skipping start"
         return 1
     fi
 
-    # Wait until SQM qdisc is present before starting (max 50s)
     for i in $(seq 1 50); do
         if tc qdisc show dev eth0 | grep -q nsstbl; then
             break
@@ -60,8 +65,7 @@ start_service() {
         sleep 1
     done
 
-    # Load default profile before starting
-    load_default_profile
+    ensure_active_symlink
 
     procd_open_instance
     procd_set_param command $SCRIPT --config $CONFIG --pidfile $PIDFILE --logfile $LOGFILE
@@ -69,23 +73,8 @@ start_service() {
     procd_set_param respawn
     procd_set_param stdout 1
     procd_set_param stderr 1
-
-    # --- Resource limits ---
-    # procd_set_param limits memory 16384 32768
-    # procd_set_param limits cpu 300 600
-
     procd_set_param env CONFIG=$CONFIG
     procd_close_instance
-}
-
-reload() {
-    echo "Reloading sqm-autorate configuration..."
-    PID=$(pidof $SCRIPT)
-    if [ -n "$PID" ]; then
-        kill -HUP "$PID" 2>/dev/null || restart
-    else
-        start
-    fi
 }
 
 status() {

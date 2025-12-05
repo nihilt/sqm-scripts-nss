@@ -5,7 +5,7 @@ use Time::HiRes qw(usleep);
 use POSIX qw(SIGHUP);
 
 # --- Config ---
-my $config_file = "/etc/sqm-autorate.conf";
+my $config_file = "/var/sqm-autorate.conf";
 my %cfg = ();
 
 sub load_config {
