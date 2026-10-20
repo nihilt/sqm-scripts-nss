@@ -226,6 +226,19 @@ egress() {
   [ -z "$ELIMIT" ] && ELIMIT=$(calc_limit ${UPLINK} ${MTU} ${MAXQLIMIT_MS})
   
   # add the shaper to the interface
+# If UCI provides explicit burst bytes, convert them to the script's burst duration (us)
+RBUP=$(uci get sqm.@queue[0].root_burst_up 2>/dev/null || true)
+RBDN=$(uci get sqm.@queue[0].root_burst_down 2>/dev/null || true)
+
+if [ -n "$RBUP" ] && [ -n "$UPLINK" ]; then
+  ESHAPER_BURST_DUR_US=$(awk -v b="$RBUP" -v s="$UPLINK" 'BEGIN{printf("%.0f", (b*8000)/s)}')
+  sqm_debug "Converted root_burst_up ${RBUP} bytes -> ESHAPER_BURST_DUR_US=${ESHAPER_BURST_DUR_US}us"
+fi
+
+if [ -n "$RBDN" ] && [ -n "$DOWNLINK" ]; then
+  ISHAPER_BURST_DUR_US=$(awk -v b="$RBDN" -v s="$DOWNLINK" 'BEGIN{printf("%.0f", (b*8000)/s)}')
+  sqm_debug "Converted root_burst_down ${RBDN} bytes -> ISHAPER_BURST_DUR_US=${ISHAPER_BURST_DUR_US}us"
+fi
   add_nsstbl ${IFACE} ${UPLINK} ${ESHAPER_BURST_DUR_US} ${MTU} || (sqm_error "egress: failed to add shaper" && return 1)
   
   # add the qdisc to the interface
@@ -247,6 +260,19 @@ ingress() {
   [ -z "$ILIMIT" ] && ILIMIT=$(calc_limit ${DOWNLINK} ${MTU} ${MAXQLIMIT_MS})
   
   # add the shaper to the interface
+# If UCI provides explicit burst bytes, convert them to the script's burst duration (us)
+RBUP=$(uci get sqm.@queue[0].root_burst_up 2>/dev/null || true)
+RBDN=$(uci get sqm.@queue[0].root_burst_down 2>/dev/null || true)
+
+if [ -n "$RBUP" ] && [ -n "$UPLINK" ]; then
+  ESHAPER_BURST_DUR_US=$(awk -v b="$RBUP" -v s="$UPLINK" 'BEGIN{printf("%.0f", (b*8000)/s)}')
+  sqm_debug "Converted root_burst_up ${RBUP} bytes -> ESHAPER_BURST_DUR_US=${ESHAPER_BURST_DUR_US}us"
+fi
+
+if [ -n "$RBDN" ] && [ -n "$DOWNLINK" ]; then
+  ISHAPER_BURST_DUR_US=$(awk -v b="$RBDN" -v s="$DOWNLINK" 'BEGIN{printf("%.0f", (b*8000)/s)}')
+  sqm_debug "Converted root_burst_down ${RBDN} bytes -> ISHAPER_BURST_DUR_US=${ISHAPER_BURST_DUR_US}us"
+fi
   add_nsstbl ${DEV} ${DOWNLINK} ${ISHAPER_BURST_DUR_US} ${MTU} || (sqm_error "ingress: failed to add shaper" && return 1)
   
   # add the qdisc to the interface
