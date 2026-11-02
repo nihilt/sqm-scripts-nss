@@ -1,381 +1,620 @@
 ###############################################################################
-# nss-rk.qos (HW Accelerated Simple Traffic Shaper)
-# version 20251129 (patched for clean startup)
+# nss-rk.qos (HW accelerated simple traffic shaper for Qualcomm NSS)
+# version 20261031-hardened
 #
-# sqm script to use the NSS accelerated nssfq_codel qdisc
+# sqm-scripts queue script that shapes with the NSS offloaded nsstbl (token
+# bucket) + nssfq_codel (fq_codel) qdiscs, so shaped traffic stays on the NSS
+# cores. Select "fq_codel" as queue discipline and "nss-rk.qos" as script in
+# LuCI (Network -> SQM QoS), on the eth device that carries the WAN traffic
+# (eth0 on the R7800).
 #
-# Based on simple.qos and nss.qos by ricsc.
-# Modified by rickk to allow configuration via (l)uci and play nicely with
-# the standard sqm scripts without throwing all kinds of errors.
+# Based on nss-rk.qos by rickk (https://github.com/rickkdotnet/sqm-scripts-nss),
+# itself based on simple.qos and nss.qos by ricsc.
 #
-# This script should be placed in your /usr/lib/sqm directory together with
-# nss-rk.qos.help.
+# Place it in /usr/lib/sqm/ (next to nss-rk.qos.help).
 #
-# To use it, select fq_codel as a queue discipline in (l)uci and nss.qos
-# for the script.
+# What this version changes compared to the stock script
 #
-# Original can be found at https://github.com/rickkdotnet/sqm-scripts-nss
-# Modified version for ipq807x can found at https://github.com/qosmio/sqm-scripts-nss
+#   * Failures are no longer masked. The stock "cmd || (log && return 1)" idiom
+#     runs "return" in a subshell, so egress()/ingress() always reported
+#     success and sqm-scripts logged "started successfully" after every error.
+#   * Start is all-or-nothing: if any step fails everything that was installed
+#     is rolled back (sqm-scripts only runs stop when a state file exists, and
+#     it only writes one after a successful start), then the start is retried
+#     a few times to ride out transient NSS firmware timeouts at boot.
+#   * Preflight: refuses to start with a clear message when the installed "tc"
+#     has no NSS qdisc support. This is what happens when tc-full/tc-bpf from
+#     the stock OpenWrt feed replaces the NSS-patched tc ("Unknown qdisc
+#     nsstbl"). Also loads the qca-nss-qdisc / nss-ifb kernel modules.
+#   * Readiness check before shaping (bounded, never hangs boot):
+#       1. the eth device must exist and be administratively up (hard
+#          requirement, nss_wait_timeout seconds);
+#       2. the logical WAN interface (default: wan) should be up and have an
+#          IPv4/IPv6 address (soft requirement, nss_wan_timeout seconds; on
+#          timeout it logs a warning and shapes anyway, unless
+#          nss_wan_required=1). Works for DHCP, PPPoE and IPv6-only WANs.
+#   * The hotplug bail-out only skips the restart when an NSS shaper really is
+#     installed (the old test succeeded whenever nssifb merely existed).
+#   * No dependency on iptables helpers that sqm-scripts removed (nftables
+#     based releases have no verify_iptables/ipt_log_*).
+#   * State file and IFACE are left untouched, so stop-sqm finds the state
+#     file it expects, also for VLAN style names such as eth0.2.
+#   * Burst bytes are taken from the sqm section of THIS interface instead of
+#     "@queue[0]". POSIX sh only, no "[[", "let" or recursion.
 #
+# Optional options in the sqm queue section (/etc/config/sqm), all optional:
+#
+#   option root_burst_up       '32768'   nsstbl burst in bytes, upload
+#   option root_burst_down     '131072'  nsstbl burst in bytes, download
+#                                        (unset: sqm default of 1000us worth)
+#   option nss_wait_timeout    '30'      seconds to wait for the eth device
+#   option nss_wan_iface       'wan'     logical interface to wait for,
+#                                        'none' disables that check
+#   option nss_wan_timeout     '20'      seconds to wait for it
+#   option nss_wan_required    '0'       1: fail instead of shaping anyway
+#   option nss_start_attempts  '3'       tries before giving up
+#
+# The same names in upper case (NSS_WAN_IFACE, ...) work as environment
+# variables and take precedence.
 ################################################################################
 
 . /lib/functions.sh
 . ${SQM_LIB_DIR}/defaults.sh
 
-# Ensure we use the full path for critical binaries
-TC=${TC:-/sbin/tc}
-IP=${IP:-/sbin/ip}
-INSMOD=${INSMOD:-/sbin/insmod}
-
-################################################################################
-# BAILOUT WHEN CALLED FROM HOTPLUG
-#
-# Restarting SQM from hotplug tends to crash the router on boot, probably because it quickly brings up, down and up again
-# the nssifb interface (it crashes on the last ip link up). Even worse when you have alias interfaces. Workaround that problem here.
-#
-# /etc/hotplug.d/iface/11-sqm reloads SQM whenever an interface (i.e: wan) associated with the device (i.e.: eth0)
-# changes state. This might be useful for dynamic interfaces, but with NSS you're always using a hardware interface
-# and it's no problem if the NSS SQM config remains in place during ifup/downs.
-#
-# However, sometimes the interface is not up when /etc/init.d/sqm runs and then you do need hotplug to bring SQM up
-# the following tries to achieve this.
-
-if [ ! -z ${ACTION} ] && [ ! -z ${INTERFACE} ] && [ ! -z ${DEVICE} ]; then
-  sqm_debug "${SCRIPT}: triggered by hotplug ${ACTION} for ${INTERFACE} (${DEVICE})"
-  if $TC qdisc show dev nssifb; then
-    sqm_log "${SCRIPT}: TC qdisc is already installed on nssifb, not restarting to minimize the risk of crashes"
-    exit 0
-  else
-    sqm_debug "${SCRIPT}: No qdisc detected on nssifb, continuing with script"
-  fi
-fi
-
-# the maximum (worst case) length of the fq_codel queue in milliseconds
-# this is used together with speed and mtu to calculate the fq_codel queue limit
-# when the limit is not specified by the user in the SQM configuration
-#
-# If the queue limit of the nssifb is hit (observable by looking at drop_overlimit in tc -s qdisc show dev nssifb)
-# I see bloat for the first few seconds of a load test until codel takes over and things stabilize.
-# That's why I like to keep it on the high side to ensure codel sees all traffic right away. The only real tradeoff is memory anyway.
+# the maximum (worst case) length of the fq_codel queue in milliseconds, used
+# with speed and mtu to compute the queue limit when none is configured
 MAXQLIMIT_MS=100
 
-# this is needed here for sqm_stop to find and delete the correct ifb interface
-CUR_IFB=nssifb
+# name of the ingress redirect device created by the nss-ifb module
+NSS_IFB=nssifb
+# needed here for sqm_stop/sqm_cleanup of sqm-scripts
+CUR_IFB=${NSS_IFB}
 
-# NSS only works on hardware interfaces, but some platforms (like R7800)
-# configure the WAN interface as a subinterface
-# just strip off the vlan tag here
-IFACE=`echo ${IFACE} | sed 's/\.[0-9]*//g'`
+# mount point of sysfs
+SYSFS=${NSS_SYSFS:-/sys}
 
-# Override the STATEFILE with the 'new' interface name from above.
-# Otherwise we'll run into trouble when stopping sqm, because the statefile
-# could be written to a filename with the subinterface
-STATE_FILE="${SQM_STATE_DIR}/${IFACE}.state"
+# NSS only works on physical eth devices. Some platforms put the WAN on a
+# vlan sub interface (eth0.2): just strip the vlan id for the tc commands.
+# IFACE and STATE_FILE are deliberately NOT modified.
+NSS_DEV=$(printf '%s' "${IFACE}" | sed 's/\.[0-9][0-9]*$//')
 
-# Kernel 5.10 frequently crashes if the nssifb interface is deleted
-# but on kernel 5.15 the qdisc only works the first time it's attached.
-# On kernel 5.15 you need to delete interface before attaching a new qdisc
+# Kernel 5.10 crashes if nssifb is deleted; on newer kernels the qdisc only
+# works the first time it is attached, so nssifb must be recreated.
+case "$(uname -r)" in
+    5.10|5.10.*) DELETENSSIFB= ; sqm_debug "Kernel 5.10 found, nssifb will not be deleted on stop" ;;
+    *)           DELETENSSIFB=1 ;;
+esac
 
-KERNELVERSION=$(uname -r)
-if [[ "${KERNELVERSION}" != *"5.10"* ]]; then
-   DELETENSSIFB=1
-else
-   sqm_debug "Kernel version 5.10 found, will not delete nssifb on reload/stop"
-fi
+###############################################################################
+# small helpers
+###############################################################################
 
-# --- Hardened check_wan() ---
-check_wan() {
-  local wan_json wan_ip
-  wan_json="$(ubus call network.interface.wan status 2>/dev/null || true)"
-  wan_ip="$(echo "$wan_json" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null || true)"
-
-  if [ -z "$wan_ip" ]; then
-    sqm_debug "check_wan: WAN not ready yet, sleeping 5 seconds..."
-    sleep 5
-    check_wan
-  else
-    sqm_debug "check_wan: IP on WAN: $wan_ip"
-  fi
-}
-
-calc_limit() {
-  [ -z ${MINLIMIT} ] && MINLIMIT=200
-  local LIMIT
-  
-  # queue-limit = (bandwidth / 8 bits) * delay / MTU
-  LIMIT=$( awk -v SPEED=$1 -v MTU=$2 -v MAXDELAY=$3 'BEGIN {print(int((SPEED*125)*(MAXDELAY/1000)/MTU))}' )
-  sqm_debug "calc_limit: Queue limit should be $LIMIT packets for speed $1, MTU $2 and maximum delay $3 ms"
-  if [ ${LIMIT} -lt ${MINLIMIT} ]; then
-    LIMIT=${MINLIMIT}
-    sqm_debug "calc_limit: calculated limit is lower than ${MINLIMIT}, raising to ${MINLIMIT}."
-  fi
-  echo $LIMIT
- 
- }
-
-# --- ipt_setup() now returns success ---
-ipt_setup() {
-
-# unfortunately, mangle doesn't work well with NSS, nor are tc filters implemented
-# so for now there's nothing to do here
-
-    sqm_debug "No iptables rules added"
+nss_is_uint() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
     return 0
-
 }
 
-cake_egress() { sqm_error "The NSS shaper is only compatible with fq_codel."; return 1; }
+# is shell function/command $1 available?
+nss_have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# queue limit = (bandwidth / 8 bits) * delay / MTU
+calc_limit() {
+    local LIMIT
+    [ -z "${MINLIMIT}" ] && MINLIMIT=200
+    LIMIT=$(awk -v SPEED="$1" -v MTU="$2" -v MAXDELAY="$3" \
+        'BEGIN {print(int((SPEED*125)*(MAXDELAY/1000)/MTU))}')
+    sqm_debug "calc_limit: queue limit should be ${LIMIT} packets for speed $1, MTU $2 and maximum delay $3 ms"
+    if ! nss_is_uint "${LIMIT}" || [ "${LIMIT}" -lt "${MINLIMIT}" ]; then
+        LIMIT=${MINLIMIT}
+    fi
+    echo "${LIMIT}"
+}
+
+# ---- UCI -------------------------------------------------------------------
+
+nss_match_section() {
+    local iface
+    [ -n "${NSS_SECTION}" ] && return 0
+    config_get iface "$1" interface
+    [ "${iface}" = "${IFACE}" ] && NSS_SECTION="$1"
+    return 0
+}
+
+# find the sqm queue section that belongs to this interface
+nss_uci_load() {
+    NSS_SECTION=
+    config_load sqm
+    config_foreach nss_match_section queue
+    sqm_debug "nss_uci_load: sqm section for ${IFACE}: ${NSS_SECTION:-<none>}"
+}
+
+# nss_opt VARIABLE uci_option default
+# environment variable wins, then the uci option, then the default
+nss_opt() {
+    local var="$1" opt="$2" def="$3" cur val=
+    eval "cur=\${${var}:-}"
+    [ -n "${cur}" ] && return 0
+    [ -n "${NSS_SECTION}" ] && config_get val "${NSS_SECTION}" "${opt}"
+    eval "${var}=\${val:-\${def}}"
+    return 0
+}
+
+nss_init_config() {
+    nss_uci_load
+
+    nss_opt ROOT_BURST_UP      root_burst_up      ""
+    nss_opt ROOT_BURST_DOWN    root_burst_down    ""
+    nss_opt NSS_WAIT_TIMEOUT   nss_wait_timeout   30
+    nss_opt NSS_WAN_IFACE      nss_wan_iface      wan
+    nss_opt NSS_WAN_TIMEOUT    nss_wan_timeout    20
+    nss_opt NSS_WAN_REQUIRED   nss_wan_required   0
+    nss_opt NSS_START_ATTEMPTS nss_start_attempts 3
+
+    nss_is_uint "${NSS_WAIT_TIMEOUT}"   || NSS_WAIT_TIMEOUT=30
+    nss_is_uint "${NSS_WAN_TIMEOUT}"    || NSS_WAN_TIMEOUT=20
+    nss_is_uint "${NSS_WAN_REQUIRED}"   || NSS_WAN_REQUIRED=0
+    nss_is_uint "${NSS_START_ATTEMPTS}" || NSS_START_ATTEMPTS=3
+    [ "${NSS_START_ATTEMPTS}" -ge 1 ]   || NSS_START_ATTEMPTS=1
+    if [ -n "${ROOT_BURST_UP}" ] && { ! nss_is_uint "${ROOT_BURST_UP}" || [ "${ROOT_BURST_UP}" -eq 0 ]; }; then
+        sqm_warn "root_burst_up '${ROOT_BURST_UP}' is not a positive number of bytes, ignoring it"
+        ROOT_BURST_UP=
+    fi
+    if [ -n "${ROOT_BURST_DOWN}" ] && { ! nss_is_uint "${ROOT_BURST_DOWN}" || [ "${ROOT_BURST_DOWN}" -eq 0 ]; }; then
+        sqm_warn "root_burst_down '${ROOT_BURST_DOWN}' is not a positive number of bytes, ignoring it"
+        ROOT_BURST_DOWN=
+    fi
+
+    if ! nss_is_uint "${UPLINK}" || ! nss_is_uint "${DOWNLINK}"; then
+        sqm_error "upload ('${UPLINK}') and download ('${DOWNLINK}') must be whole numbers in kbit/s"
+        return 1
+    fi
+
+    # the NSS qdiscs are fq_codel only; the sqm helpers (get_quantum, get_limit,
+    # get_target) key off $QDISC, so make sure they behave accordingly
+    case "${QDISC}" in
+        fq_codel) ;;
+        *) sqm_warn "the NSS shaper only supports fq_codel, ignoring queue discipline '${QDISC}'"
+           QDISC=fq_codel ;;
+    esac
+
+    # nss-ifb only works on the eth (GMAC) devices. On DSA builds the WAN
+    # port "wan" is only a user port; the traffic of it flows through eth0.
+    case "${NSS_DEV}" in
+        eth[0-9]*) ;;
+        *) sqm_warn "'${NSS_DEV}' is not an eth device. The NSS shaper only works on the eth devices (eth0 on the R7800), not on DSA ports such as wan/lan1, bridges or ppp interfaces; select eth0 in the SQM interface setting" ;;
+    esac
+    return 0
+}
+
+###############################################################################
+# preflight: tc and kernel module support
+###############################################################################
+
+nss_preflight() {
+    local tcbin out q
+
+    tcbin=${TC_BINARY:-$(command -v tc)}
+    if [ -z "${tcbin}" ] || [ ! -x "${tcbin}" ]; then
+        sqm_error "no tc binary found"
+        return 1
+    fi
+
+    # "help" makes tc parse the qdisc name and print its usage without sending
+    # anything to the kernel. A tc without NSS support answers
+    # 'Unknown qdisc "nsstbl", hence option "help" is unparsable'.
+    for q in nsstbl nssfq_codel; do
+        out=$("${tcbin}" qdisc add dev lo root handle 1: "${q}" help 2>&1)
+        case "${out}" in
+            *"Unknown qdisc"*)
+                sqm_error "${tcbin} (-> $(readlink -f "${tcbin}" 2>/dev/null)) has no support for the NSS qdisc '${q}'."
+                sqm_error "It is probably tc-full/tc-bpf from the stock OpenWrt feed replacing the NSS patched tc (tc-tiny). Reinstall the tc from your NSS image."
+                return 1 ;;
+        esac
+    done
+
+    # kernel side: autoloaded normally, try to load it if it is not
+    if [ ! -d "${SYSFS}/module/qca_nss_qdisc" ]; then
+        sqm_debug "nss_preflight: qca-nss-qdisc not loaded, trying to load it"
+        ${INSMOD} qca-nss-qdisc 2>>"${OUTPUT_TARGET}"
+        [ -d "${SYSFS}/module/qca_nss_qdisc" ] || \
+            sqm_warn "kernel module qca-nss-qdisc not found in sysfs (kmod-qca-nss-drv-qdisc installed? built in?); continuing"
+    fi
+    return 0
+}
+
+###############################################################################
+# readiness: eth device up, logical WAN up
+###############################################################################
+
+# device exists and is administratively up (IFF_UP in /sys/class/net/x/flags)
+nss_dev_ready() {
+    local flags
+    [ -d "${SYSFS}/class/net/$1" ] || return 1
+    flags=$(cat "${SYSFS}/class/net/$1/flags" 2>/dev/null)
+    [ -n "${flags}" ] || return 1
+    [ $(( flags & 1 )) -eq 1 ]
+}
+
+# 0: up and has an address, 1: not ready (yet), 2: no such interface
+nss_wan_state() {
+    local json up addr
+    json=$(ubus call "network.interface.$1" status 2>/dev/null) || return 2
+    up=$(printf '%s' "${json}" | jsonfilter -e '@.up' 2>/dev/null)
+    case "${up}" in
+        true|1) ;;
+        *) return 1 ;;
+    esac
+    addr=$(printf '%s' "${json}" | jsonfilter \
+        -e '@["ipv4-address"][0].address' \
+        -e '@["ipv6-address"][0].address' \
+        -e '@["ipv6-prefix"][0].address' 2>/dev/null)
+    [ -n "${addr}" ]
+}
+
+nss_wait_ready() {
+    local i=0 nf=0 rc
+
+    # 1. the eth device (hard requirement)
+    while ! nss_dev_ready "${NSS_DEV}"; do
+        if [ "${i}" -ge "${NSS_WAIT_TIMEOUT}" ]; then
+            sqm_error "${NSS_DEV} does not exist or is not up after ${NSS_WAIT_TIMEOUT}s, not starting"
+            return 1
+        fi
+        [ "${i}" -eq 0 ] && sqm_log "waiting up to ${NSS_WAIT_TIMEOUT}s for ${NSS_DEV} to come up.."
+        sleep 1
+        i=$((i + 1))
+    done
+    sqm_debug "nss_wait_ready: ${NSS_DEV} is up"
+
+    # 2. the logical WAN interface (soft requirement)
+    case "${NSS_WAN_IFACE}" in
+        ''|none|off|0)
+            sqm_debug "nss_wait_ready: logical WAN check disabled"
+            return 0 ;;
+    esac
+    if ! nss_have ubus || ! nss_have jsonfilter; then
+        sqm_debug "nss_wait_ready: ubus/jsonfilter not available, skipping the logical WAN check"
+        return 0
+    fi
+
+    i=0
+    while :; do
+        nss_wan_state "${NSS_WAN_IFACE}"
+        rc=$?
+        if [ "${rc}" -eq 0 ]; then
+            sqm_debug "nss_wait_ready: logical interface ${NSS_WAN_IFACE} is up"
+            return 0
+        fi
+        if [ "${rc}" -eq 2 ]; then
+            nf=$((nf + 1))
+            if [ "${nf}" -ge 5 ]; then
+                sqm_warn "logical interface '${NSS_WAN_IFACE}' does not exist, not waiting for it (set nss_wan_iface to your WAN interface, or to 'none')"
+                return 0
+            fi
+        fi
+        if [ "${i}" -ge "${NSS_WAN_TIMEOUT}" ]; then
+            if [ "${NSS_WAN_REQUIRED}" -ne 0 ]; then
+                sqm_error "WAN interface '${NSS_WAN_IFACE}' is not up after ${NSS_WAN_TIMEOUT}s and nss_wan_required is set, not starting"
+                return 1
+            fi
+            sqm_warn "WAN interface '${NSS_WAN_IFACE}' is not up after ${NSS_WAN_TIMEOUT}s, shaping ${NSS_DEV} anyway"
+            return 0
+        fi
+        [ "${i}" -eq 0 ] && sqm_log "waiting up to ${NSS_WAN_TIMEOUT}s for WAN interface ${NSS_WAN_IFACE}.."
+        sleep 1
+        i=$((i + 1))
+    done
+}
+
+###############################################################################
+# the shapers
+###############################################################################
+
+# is an NSS shaper (nsstbl) installed on device $1?
+nss_has_shaper() {
+    "${TC_BINARY:-tc}" qdisc show dev "$1" 2>/dev/null | grep -q 'qdisc nsstbl'
+}
+
+# is the configured shaping in place on all devices?
+nss_shaper_present() {
+    nss_is_uint "${UPLINK}"   || return 1
+    nss_is_uint "${DOWNLINK}" || return 1
+    [ -d "${SYSFS}/class/net/${NSS_DEV}" ] || return 1
+    [ "${UPLINK}" -eq 0 ] || nss_has_shaper "${NSS_DEV}" || return 1
+    [ "${DOWNLINK}" -eq 0 ] && return 0
+    [ -d "${SYSFS}/class/net/${NSS_IFB}" ] && nss_has_shaper "${NSS_IFB}"
+}
+
+# nsstbl (token bucket limiter)
+# add_nsstbl DEV SPEED_KBIT BURST_BYTES(or empty) BURST_US MTU
+add_nsstbl() {
+    local dev="$1" speed="$2" rburst="$3" burst_us="$4" mtu="$5" burst
+
+    if [ -n "${rburst}" ]; then
+        # explicit value from uci: use exactly that (but at least one packet)
+        burst=${rburst}
+        [ "${burst}" -lt "${mtu}" ] && burst=${mtu}
+    else
+        # burst is a tradeoff between cpu load and strictness of the shaper;
+        # the sqm default of 1000us works well, rounded to a multiple of the mtu
+        burst=$(get_burst "${mtu}" "${speed}" "${burst_us}")
+        burst=$(echo "${burst}" | awk -v MTU="${mtu}" \
+            '{b = sprintf("%.0f", $0 / MTU) * MTU; if (b < MTU) b = MTU; print b}')
+    fi
+    sqm_debug "add_nsstbl ${dev}: speed:${speed} burst:${burst} mtu:${mtu}"
+
+    $TC qdisc add dev "${dev}" root handle 1: nsstbl rate "${speed}kbit" burst "${burst}" mtu "${mtu}b" || return 1
+    NSS_LAST_BURST=${burst}
+    return 0
+}
+
+# nssfq_codel child
+# add_nssfq_codel DEV SPEED_KBIT TARGET LIMIT MTU OPTS
+add_nssfq_codel() {
+    local dev="$1" speed="$2" target="$3" limit="$4" mtu="$5" opts="$6"
+    local q lim tgt
+
+    sqm_debug "add_nssfq_codel ${dev}: speed:${speed} target:${target} limit:${limit} mtu:${mtu} opts:${opts}"
+
+    # codel interval: should be the average worst case latency to your services
+    case " ${opts} " in
+        *" interval "*) ;;
+        *) opts="interval 100ms ${opts}" ;;
+    esac
+
+    # quantum: bytes dequeued at once; below 100 Mbit a small quantum gives
+    # small packets more weight
+    case " ${opts} " in
+        *" quantum "*) ;;
+        *) q=${mtu}
+           [ "${speed}" -lt 100000 ] && q=$(( q / 5 + 1 ))
+           opts="$(get_quantum "${q}") ${opts}" ;;
+    esac
+
+    # flows is required by nssfq_codel
+    case " ${opts} " in
+        *" flows "*) ;;
+        *) opts="flows 1024 ${opts}" ;;
+    esac
+
+    # computed limit/target only when the user did not give their own
+    case " ${opts} " in
+        *" limit "*) lim= ;;
+        *) lim=$(get_limit "${limit}") ;;
+    esac
+    case " ${opts} " in
+        *" target "*) tgt= ;;
+        *) tgt=$(get_target "${target}" "${speed}") ;;
+    esac
+
+    # shellcheck disable=SC2086  # options are intentionally word split
+    $TC qdisc add dev "${dev}" parent 1: handle 10: nssfq_codel ${lim} ${tgt} ${opts} set_default || return 1
+    return 0
+}
+
+# MTU of $1 as seen by the NSS shaper (device mtu + ethernet/NSS overhead)
+nss_mtu() {
+    local m ov
+    m=$(cat "${SYSFS}/class/net/$1/mtu" 2>/dev/null)
+    if ! nss_is_uint "${m}" || [ "${m}" -eq 0 ]; then
+        sqm_warn "cannot read the MTU of $1, assuming 1500"
+        m=1500
+    fi
+    # Without an explicit overhead use 18: maxpacket shows 1518 byte packets
+    # hitting the shaper (14 ethernet + 4 NSS)
+    ov=${OVERHEAD:-0}
+    nss_is_uint "${ov}" || ov=0
+    [ "${ov}" -eq 0 ] && ov=18
+    echo $(( m + ov ))
+}
+
+# nss_shape_dev DEV SPEED TARGET LIMIT(or empty) OPTS BURST_BYTES(or empty) BURST_US
+nss_shape_dev() {
+    local dev="$1" speed="$2" target="$3" limit="$4" opts="$5" rburst="$6" burst_us="$7"
+    local mtu
+
+    mtu=$(nss_mtu "${dev}")
+    [ -z "${limit}" ] && limit=$(calc_limit "${speed}" "${mtu}" "${MAXQLIMIT_MS}")
+
+    # idempotent: drop whatever is left from an earlier run
+    SILENT=1 $TC qdisc del dev "${dev}" root
+
+    add_nsstbl "${dev}" "${speed}" "${rburst}" "${burst_us}" "${mtu}" || return 1
+    add_nssfq_codel "${dev}" "${speed}" "${target}" "${limit}" "${mtu}" "${opts}" || return 1
+    sqm_log "NSS shaper on ${dev}: ${speed} kbit/s, burst ${NSS_LAST_BURST} bytes, mtu ${mtu}"
+    return 0
+}
+
+nss_egress() {
+    [ -z "${ETARGET}" ] && ETARGET="5ms"
+    nss_shape_dev "${NSS_DEV}" "${UPLINK}" "${ETARGET}" "${ELIMIT}" "${EQDISC_OPTS}" \
+        "${ROOT_BURST_UP}" "${ESHAPER_BURST_DUR_US}" || { sqm_error "egress: failed to set up the NSS shaper on ${NSS_DEV}"; return 1; }
+    return 0
+}
+
+nss_ingress() {
+    [ -z "${ITARGET}" ] && ITARGET="5ms"
+    nss_shape_dev "${NSS_IFB}" "${DOWNLINK}" "${ITARGET}" "${ILIMIT}" "${IQDISC_OPTS}" \
+        "${ROOT_BURST_DOWN}" "${ISHAPER_BURST_DUR_US}" || { sqm_error "ingress: failed to set up the NSS shaper on ${NSS_IFB}"; return 1; }
+
+    # The system likes to crash at this point, especially at high load.
+    # Sleep a little, hopefully this prevents a crash on restart of sqm.
+    sqm_debug "ingress: sleeping for a second before enabling ${NSS_IFB}.."
+    sleep 1
+    sqm_debug "ingress: enabling ${NSS_IFB}.."
+    $IP link set up dev "${NSS_IFB}" || { sqm_error "ingress: cannot bring up ${NSS_IFB}"; return 1; }
+    return 0
+}
+
+###############################################################################
+# nssifb interface handling
+###############################################################################
+
+nss_ifb_exists() {
+    [ -d "${SYSFS}/class/net/${NSS_IFB}" ]
+}
+
+nss_ifb_teardown() {
+    nss_ifb_exists || return 0
+    SILENT=1 $TC qdisc del dev "${NSS_IFB}" root
+    if [ -n "${DELETENSSIFB}" ]; then
+        SILENT=1 $IP link set dev "${NSS_IFB}" down
+        SILENT=1 $IP link delete dev "${NSS_IFB}" type nss_ifb
+        sqm_debug "${NSS_IFB} interface deleted"
+    else
+        sqm_debug "not deleting ${NSS_IFB} (kernel 5.10 workaround)"
+    fi
+    return 0
+}
+
+# kernel module + fresh nssifb interface
+nss_prepare_ifb() {
+    # the standard sqm-scripts do_modules() knows nothing about nss-ifb
+    if [ ! -d "${SYSFS}/module/nss_ifb" ]; then
+        sqm_log "required nss_ifb kernel module not detected, loading it now.."
+        ${INSMOD} nss-ifb 2>>"${OUTPUT_TARGET}"
+        if [ ! -d "${SYSFS}/module/nss_ifb" ]; then
+            sqm_error "kernel module nss-ifb failed to load (is kmod-nss-ifb installed?)"
+            return 1
+        fi
+    fi
+
+    # which physical device nssifb redirects; has to be set before it is brought up
+    if [ -w "${SYSFS}/module/nss_ifb/parameters/nss_dev_name" ]; then
+        printf '%s' "${NSS_DEV}" > "${SYSFS}/module/nss_ifb/parameters/nss_dev_name" || \
+            sqm_warn "could not set nss_ifb source device to ${NSS_DEV}"
+    else
+        sqm_debug "nss_ifb has no writable nss_dev_name parameter, assuming the default (eth0)"
+    fi
+
+    # start from a clean interface when a previous run left one behind
+    if nss_ifb_exists && [ -n "${DELETENSSIFB}" ]; then
+        sqm_debug "${NSS_IFB} already exists, recreating it"
+        nss_ifb_teardown
+    fi
+
+    if ! nss_ifb_exists; then
+        sqm_log "${NSS_IFB} interface does not exist, creating.."
+        $IP link add dev "${NSS_IFB}" type nss_ifb || return 1
+    fi
+    return 0
+}
+
+###############################################################################
+# start / stop / cleanup, called by sqm-scripts
+###############################################################################
+
+# undo whatever a failed start left behind
+nss_rollback() {
+    sqm_debug "rolling back partial NSS shaper setup"
+    SILENT=1 $TC qdisc del dev "${NSS_DEV}" root
+    nss_ifb_teardown
+    return 0
+}
+
+# the actual setup, once
+nss_start_once() {
+    if [ "${UPLINK}" -ne 0 ]; then
+        CUR_DIRECTION="egress"
+        nss_egress || return 1
+    else
+        SILENT=1 $TC qdisc del dev "${NSS_DEV}" root
+        sqm_log "egress shaping deactivated"
+    fi
+
+    if [ "${DOWNLINK}" -ne 0 ]; then
+        CUR_DIRECTION="ingress"
+        nss_prepare_ifb || return 1
+        nss_ingress || return 1
+    else
+        nss_ifb_teardown
+        sqm_log "ingress shaping deactivated"
+    fi
+
+    # trust but verify: the qdiscs must really be there
+    if [ "${UPLINK}" -ne 0 ] && ! nss_has_shaper "${NSS_DEV}"; then
+        sqm_error "verification failed: no NSS shaper on ${NSS_DEV}"
+        return 1
+    fi
+    if [ "${DOWNLINK}" -ne 0 ] && ! nss_has_shaper "${NSS_IFB}"; then
+        sqm_error "verification failed: no NSS shaper on ${NSS_IFB}"
+        return 1
+    fi
+    return 0
+}
+
+# We override the stock sqm_start: it calls verify_qdisc, which creates and
+# destroys ifb devices and knows nothing about the NSS qdiscs.
+sqm_start() {
+    local attempt=1
+
+    sqm_debug "sqm_start: starting nss-rk.qos"
+    [ -n "${IFACE}" ] || return 1
+
+    nss_init_config || return 1
+    nss_preflight || return 1
+    nss_wait_ready || return 1
+
+    while :; do
+        if nss_start_once; then
+            return 0
+        fi
+        nss_rollback
+        if [ "${attempt}" -ge "${NSS_START_ATTEMPTS}" ]; then
+            sqm_error "NSS shaping could not be started on ${IFACE} after ${attempt} attempt(s), giving up"
+            return 1
+        fi
+        sqm_warn "NSS shaping attempt ${attempt}/${NSS_START_ATTEMPTS} failed, retrying in 3s"
+        attempt=$((attempt + 1))
+        sleep 3
+    done
+}
+
+# Custom stop: the standard function would delete an ifb of the wrong type.
+sqm_stop() {
+    SILENT=1 $TC qdisc del dev "${NSS_DEV}" root
+    nss_ifb_teardown
+    nss_have nft_cleanup && nft_cleanup
+    return 0
+}
+
+# called by stop-sqm for "run.sh cleanup"
+sqm_cleanup() {
+    sqm_stop
+}
+
+# NSS qdiscs are fq_codel only
+cake_egress()  { sqm_error "The NSS shaper is only compatible with fq_codel."; return 1; }
 cake_ingress() { sqm_error "The NSS shaper is only compatible with fq_codel."; return 1; }
 
-# Sets up the NSS TBL (token bucket limiter) shaper
-add_nsstbl() {
-  local IF=$1 SPEED=$2 BURST_US=$3 MTU=$4
-  local LOGT="add_nsstbl $IF:"
-  sqm_debug "$LOGT interface:$IF speed:$SPEED burst:$BURST_US mtu:$MTU overhead:$OVERHEAD"
-  
-  # BURST
-  #
-  # burst is a tradeoff between cpu load and strictness of the shaper
-  # effects are pretty minimal either way with NSS, the SQM scripts default of 1000us
-  # seems to be a good sweet spot and counter-intuitively appears a bit more stable
-  # in both throughput and latency than a minimimal burst
-  
-  BURST=`get_burst ${MTU} ${SPEED} ${BURST_US}`
-  
-  # round to nearest multiple of MTU.
-  BURST=`echo ${BURST} | awk -v MTU=$MTU '{print sprintf("%.0f",$0/MTU)*MTU}'`
-  
-  # Add the qdisc
-  $TC qdisc add dev $IF root handle 1: nsstbl rate ${SPEED}kbit burst ${BURST} mtu ${MTU}b || return 1
-  
-  return 0
-}
+###############################################################################
+# BAIL OUT WHEN CALLED FROM HOTPLUG
+#
+# /etc/hotplug.d/iface/11-sqm restarts SQM whenever an interface associated
+# with the device changes state. With NSS the shaper sits on a hardware device
+# and does not care about ifup/ifdown, while bouncing nssifb up and down in
+# quick succession can crash the router. So when hotplug calls us and the NSS
+# shaper is installed already, leave it alone. If it is NOT installed (SQM came
+# up before the interface did), carry on and install it.
+#
+# Note for DSA builds (R7800, C2600, ...): hotplug reports the user port ("wan")
+# as DEVICE, which never matches the SQM instance on eth0, so sqm-scripts'
+# hotplug script does not restart or start it at all there. If the start at
+# boot failed, the optional 12-sqm-nss hotplug script (shipped next to this
+# file) starts it again when the WAN interface comes up.
+###############################################################################
 
-# Sets up the NSS fq_codel qdisc
-add_nssfq_codel() {
-  local IF=$1 SPEED=$2 TARGET=$3 LIMIT=$4 MTU=$5 QDISC_OPTS=$6
-  local LOGT="add_nssfq_codel $IF:"
-  sqm_debug "$LOGT interface:$IF speed:$SPEED target:$TARGET limit:$LIMIT mtu:$MTU opts:$QDISC_OPTS"
-  
-  # INTERVAL
-  #
-  # this allows you to set the codel interval via (l)uci eqdisc_opts
-  # You should set this to the average "worst case" latency towards your services
-  # if no interval statement is present, set a sensible default
-  if [[ "${QDISC_OPTS}" != *"interval"* ]]; then
-    sqm_debug "$LOGT No interval specified, defaulting to 100ms"
-    
-    # 100ms works well in most cases, unless the link speed is so slow that target > interval
-    # but you probably don't want/need NSS in that case anyway, so I don't bother.
-    QDISC_OPTS="interval 100ms ${QDISC_OPTS}"
-  fi
-  
-  # QUANTUM
-  #
-  # Quantum defines how much bytes may be dequeued at once. At MTU, all packets have equal weight
-  # but lower quantums give smaller packets more weight. I.e. with a quantum of 300, a <300 byte
-  # packet is 5 times likelier to be dequeued than a 1500 byte packet.
-  # At high rates this doesn't make much difference but at low speeds it does
-  
-  if [[ "${QDISC_OPTS}" != *"quantum"* ]]; then
-  
-    # use the interface mtu, this seems to work well in almost all cases
-    # add 14 bytes for the ethernet header and 4 bytes for NSS
-    let QUANTUM=MTU
-    
-    # at speeds <100Mb, a quantum of ~300 helps prioritize small packets
-    # https://www.bufferbloat.net/projects/codel/wiki/Best_practices_for_benchmarking_Codel_and_FQ_Codel/
-    if [ ${SPEED} -lt 100000 ]; then
-      let QUANTUM/=5
-      let QUANTUM+=1
+if [ -n "${ACTION}" ] && [ -n "${INTERFACE}" ] && [ -n "${DEVICE}" ]; then
+    sqm_debug "${SCRIPT}: triggered by hotplug ${ACTION} for ${INTERFACE} (${DEVICE})"
+    if nss_shaper_present; then
+        sqm_log "${SCRIPT}: NSS shaper already installed on ${NSS_DEV}, not touching it on hotplug ${ACTION} ${INTERFACE}"
+        exit 0
     fi
-    
-    QDISC_OPTS="`get_quantum ${QUANTUM}` ${QDISC_OPTS}"
-  fi
-  
-  # FLOWS
-  #
-  # The number of flows into which packets are classified
-  # required argument for nssfq_codel
-  if [[ "${QDISC_OPTS}" != *"flows"* ]]; then
-    QDISC_OPTS="flows 1024 ${QDISC_OPTS}"
-  fi
-  
-  # Add the qdisc to the interface
-  $TC qdisc add dev $IF parent 1: handle 10: nssfq_codel `get_limit $LIMIT` `get_target ${TARGET} ${SPEED}` ${QDISC_OPTS} set_default || return 1
-  return 0
-}
-
-egress() {
-
-  # Codel target interval, when not set use a reasonable default
-  [ -z "$ETARGET" ] && ETARGET="5ms"
-  
-  # MTU
-  #
-  local MTU=$( get_mtu ${IFACE} )
-  
-  # if we leave this empty the qdisc uses a default of 1514. However, when you enable NSS
-  # maxpacket in tc -s qdisc will show that 1518b packets are hitting the shaper, which is probably due to a header
-  # added by NSS. Not sure what is correct, but it's probably better to err on the large side
-  # If you don't like this, just set the overhead in the SQM config to 0 or 14.
-  [ "${OVERHEAD}" -eq 0 ] && OVERHEAD=18
-  let MTU+=OVERHEAD
-  
-  # If there's no queue limit configured, calculate one
-  [ -z "$ELIMIT" ] && ELIMIT=$(calc_limit ${UPLINK} ${MTU} ${MAXQLIMIT_MS})
-  
-  # add the shaper to the interface
-# If UCI provides explicit burst bytes, convert them to the script's burst duration (us)
-RBUP=$(uci get sqm.@queue[0].root_burst_up 2>/dev/null || true)
-RBDN=$(uci get sqm.@queue[0].root_burst_down 2>/dev/null || true)
-
-if [ -n "$RBUP" ] && [ -n "$UPLINK" ]; then
-  ESHAPER_BURST_DUR_US=$(awk -v b="$RBUP" -v s="$UPLINK" 'BEGIN{printf("%.0f", (b*8000)/s)}')
-  sqm_debug "Converted root_burst_up ${RBUP} bytes -> ESHAPER_BURST_DUR_US=${ESHAPER_BURST_DUR_US}us"
+    sqm_debug "${SCRIPT}: no complete NSS shaper detected, continuing"
 fi
-
-if [ -n "$RBDN" ] && [ -n "$DOWNLINK" ]; then
-  ISHAPER_BURST_DUR_US=$(awk -v b="$RBDN" -v s="$DOWNLINK" 'BEGIN{printf("%.0f", (b*8000)/s)}')
-  sqm_debug "Converted root_burst_down ${RBDN} bytes -> ISHAPER_BURST_DUR_US=${ISHAPER_BURST_DUR_US}us"
-fi
-  add_nsstbl ${IFACE} ${UPLINK} ${ESHAPER_BURST_DUR_US} ${MTU} || (sqm_error "egress: failed to add shaper" && return 1)
-  
-  # add the qdisc to the interface
-  add_nssfq_codel ${IFACE} ${UPLINK} ${ETARGET} ${ELIMIT} ${MTU} "${EQDISC_OPTS}" || (sqm_error "egress: failed to add qdisc" && return 1)
-  return 0
-}
-
-ingress() {
-
-  # Codel target interval, when not set use a reasonable default
-  [ -z "$ITARGET" ] && ITARGET="5ms"
-  
-  # MTU, see egress for more info
-  local MTU=$( get_mtu $DEV )
-  [ "${OVERHEAD}" -eq 0 ] && OVERHEAD=18
-  let MTU+=OVERHEAD
-  
-  # If there's no queue limit configured, calculate one
-  [ -z "$ILIMIT" ] && ILIMIT=$(calc_limit ${DOWNLINK} ${MTU} ${MAXQLIMIT_MS})
-  
-  # add the shaper to the interface
-# If UCI provides explicit burst bytes, convert them to the script's burst duration (us)
-RBUP=$(uci get sqm.@queue[0].root_burst_up 2>/dev/null || true)
-RBDN=$(uci get sqm.@queue[0].root_burst_down 2>/dev/null || true)
-
-if [ -n "$RBUP" ] && [ -n "$UPLINK" ]; then
-  ESHAPER_BURST_DUR_US=$(awk -v b="$RBUP" -v s="$UPLINK" 'BEGIN{printf("%.0f", (b*8000)/s)}')
-  sqm_debug "Converted root_burst_up ${RBUP} bytes -> ESHAPER_BURST_DUR_US=${ESHAPER_BURST_DUR_US}us"
-fi
-
-if [ -n "$RBDN" ] && [ -n "$DOWNLINK" ]; then
-  ISHAPER_BURST_DUR_US=$(awk -v b="$RBDN" -v s="$DOWNLINK" 'BEGIN{printf("%.0f", (b*8000)/s)}')
-  sqm_debug "Converted root_burst_down ${RBDN} bytes -> ISHAPER_BURST_DUR_US=${ISHAPER_BURST_DUR_US}us"
-fi
-  add_nsstbl ${DEV} ${DOWNLINK} ${ISHAPER_BURST_DUR_US} ${MTU} || (sqm_error "ingress: failed to add shaper" && return 1)
-  
-  # add the qdisc to the interface
-  add_nssfq_codel ${DEV} ${DOWNLINK} ${ITARGET} ${ILIMIT} ${MTU} "${IQDISC_OPTS}" || (sqm_error "ingress: failed to add shaper" && return 1)
-  
-  # The system likes to crash at this point, especially at high load.
-  # sleep a little, hopefully this prevents the system from crashing on restart of sqm
-  sqm_debug "sqm_stop: Sleeping for a second.. "
-  sleep 1
-  sqm_debug "ingress: Enabling the $DEV ifb interface.. "
-  $IP link set up $DEV || return 1
-  return 0
-}
-
-# load modules and create nssifb interface if needed
-sqm_prepare_script() {
-# sqm-scripts standard do_modules does not insert the necessary nss_ifb module
-    # load it here if it's not loaded, so we can keep all NSS changes together in this script
-    if [ ! -d /sys/module/nss_ifb ]; then
-      sqm_log "sqm_prepare_script: required nss_ifb kernel module not detected, loading it now.. "
-      $INSMOD nss-ifb 2>>${OUTPUT_TARGET} || (sqm_error "Kernel module failed to load" && return 1)
-    fi
-    
-    # This in theory allows you to change the device the ifb is active on. Not tested.
-    printf ${IFACE} > /sys/module/nss_ifb/parameters/nss_dev_name
-    
-    # the default sqm-stop script deletes the nssifb interface
-    if [ ! -d /sys/devices/virtual/net/nssifb ]; then
-      sqm_log "sqm_prepare_script: nssifb interface does not exist, creating.. "
-      
-      # add the interface
-      $IP link add dev nssifb type nss_ifb || return 1
-    fi
-    verify_iptables || return 1
-    ipt_setup
-    return 0
-}
-
-# we override the stock sqm_start here, because this calls verify_qdisc which in turn
-# causes IFB interfaces being created (and destroyed) and this is a bit ugly.
-# The logic is pretty much the same though.
-sqm_start() {
-    sqm_debug "sqm_start: Starting sqm_start from nss.qos"
-    [ -n "$IFACE" ] || return
-    
-    # reset the iptables trace log
-    ipt_log_restart
-    check_wan
-    sqm_prepare_script
-    DEV="nssifb"
-
-    if [ "${UPLINK}" -ne 0 ]; then
-      CUR_DIRECTION="egress"
-      if fn_exists egress && egress; then
-        sqm_log "sqm_start: egress shaping activated"
-      else
-        sqm_warn "sqm_start: ${SCRIPT} lacks egress() function or exited with an error"
-      fi
-    else
-      SILENT=1 $TC qdisc del dev ${IFACE} root
-      sqm_log "sqm_start: egress shaping deactivated"
-    fi
-
-    if [ "${DOWNLINK}" -ne 0 ]; then
-      CUR_DIRECTION="ingress"
-      if fn_exists ingress && ingress; then
-        sqm_log "sqm_start: ingress shaping activated"
-      else
-        sqm_warn "sqm_start: ${SCRIPT} lacks ingress() function or exited with an error"
-      fi
-    else
-      SILENT=1 $TC qdisc del dev ${DEV} root
-      sqm_log "sqm_start: ingress shaping deactivated"
-    fi
-
-    return 0
-}
-
-# custom sqm_stop, because the standard function deletes the ifb which
-# causes nssifb to crash if the interface is recreated and enabled
-# --- sqm_stop() cleanup ---
-sqm_stop() {
-    if [ "${DOWNLINK}" -ne 0 ]; then
-       $TC qdisc del dev $IFACE root
-       [ -n "$CUR_IFB" ] && $TC qdisc del dev $CUR_IFB root
-       [ -n "$CUR_IFB" ] && sqm_debug "${0}: ${CUR_IFB} shaper deleted"
-    fi
-
-    # undo accumulated ipt commands during shutdown
-    ipt_log_rewind
-    # reset the iptables trace log
-    ipt_log_restart
-
-    if [ -n "$DELETENSSIFB" ]; then
-        [ -n "$CUR_IFB" ] && $IP link set dev "${CUR_IFB}" down
-        [ -n "$CUR_IFB" ] && $IP link delete "${CUR_IFB}" type nss_ifb
-        [ -n "$CUR_IFB" ] && sqm_debug "${0}: ${CUR_IFB} interface deleted"
-    else
-        # workaround a bug in nssifb on kernel 5.10
-        sqm_debug "${0}: Not deleting $CUR_IFB because variable DELETENSSIFB is not set"
-    fi
-
-    return 0
-}
 
 # vim: syntax=sh ts=4 sw=4 sts=4
