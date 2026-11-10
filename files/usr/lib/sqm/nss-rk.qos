@@ -1,6 +1,6 @@
 ###############################################################################
 # nss-rk.qos (HW accelerated simple traffic shaper for Qualcomm NSS)
-# version 20261031-hardened
+# version 20261109.2-hardened
 #
 # sqm-scripts queue script that shapes with the NSS offloaded nsstbl (token
 # bucket) + nssfq_codel (fq_codel) qdiscs, so shaped traffic stays on the NSS
@@ -53,6 +53,17 @@
 #   option nss_wan_timeout     '20'      seconds to wait for it
 #   option nss_wan_required    '0'       1: fail instead of shaping anyway
 #   option nss_start_attempts  '3'       tries before giving up
+#   option nss_keep_ifb        '1'       1: never delete nssifb on stop/restart,
+#                                        0: delete and recreate it every time.
+#                                        Default: 1 on kernels 5.10 and 6.18,
+#                                        0 on every other kernel (see below)
+#   option nss_reload_autorate '1'       1: after every successful start, ask a
+#                                        RUNNING sqm-autorate to reload, so it
+#                                        re-applies its rates and burst (SQM
+#                                        has just reset them to the static
+#                                        values). Does nothing when autorate
+#                                        is not installed or not running and
+#                                        never starts it. 0: do not touch it.
 #
 # The same names in upper case (NSS_WAN_IFACE, ...) work as environment
 # variables and take precedence.
@@ -73,16 +84,27 @@ CUR_IFB=${NSS_IFB}
 # mount point of sysfs
 SYSFS=${NSS_SYSFS:-/sys}
 
+# init script of sqm-autorate (nihilt/sqm-autorate-nss), see nss_autorate_reload
+NSS_AUTORATE_INIT=${NSS_AUTORATE_INIT:-/etc/init.d/sqm-autorate}
+
 # NSS only works on physical eth devices. Some platforms put the WAN on a
 # vlan sub interface (eth0.2): just strip the vlan id for the tc commands.
 # IFACE and STATE_FILE are deliberately NOT modified.
 NSS_DEV=$(printf '%s' "${IFACE}" | sed 's/\.[0-9][0-9]*$//')
 
-# Kernel 5.10 crashes if nssifb is deleted; on newer kernels the qdisc only
-# works the first time it is attached, so nssifb must be recreated.
+# Should nssifb be deleted on stop/restart?
+#   5.10: no, deleting it frequently crashes the kernel (stock script).
+#   5.15: yes, the qdisc only works the first time it is attached there, so
+#         the interface has to be recreated (stock script).
+#   6.18: no. Deleting and recreating nssifb on every restart was suspected of
+#         crashing the router now and then. Tested on an R7800 (DSA): about 20
+#         back to back restarts, the ingress shaper kept counting after every
+#         re-attach, nothing crashed.
+#   other kernels: unverified, the stock behaviour (delete) is kept.
+# The uci option nss_keep_ifb 0|1 overrides this (nss_apply_keep_ifb).
 case "$(uname -r)" in
-    5.10|5.10.*) DELETENSSIFB= ; sqm_debug "Kernel 5.10 found, nssifb will not be deleted on stop" ;;
-    *)           DELETENSSIFB=1 ;;
+    5.10|5.10.*|6.18|6.18.*) NSS_KEEP_IFB_DEFAULT=1; DELETENSSIFB= ;;
+    *)                       NSS_KEEP_IFB_DEFAULT=0; DELETENSSIFB=1 ;;
 esac
 
 ###############################################################################
@@ -143,6 +165,25 @@ nss_opt() {
     return 0
 }
 
+# keep or delete nssifb on stop: nss_keep_ifb (uci/env) or the kernel default.
+# Needs NSS_SECTION to be loaded already (nss_uci_load).
+nss_apply_keep_ifb() {
+    nss_opt NSS_KEEP_IFB nss_keep_ifb "${NSS_KEEP_IFB_DEFAULT}"
+    case "${NSS_KEEP_IFB}" in
+        0|1) ;;
+        *) sqm_warn "nss_keep_ifb '${NSS_KEEP_IFB}' is not 0 or 1, using the default (${NSS_KEEP_IFB_DEFAULT})"
+           NSS_KEEP_IFB=${NSS_KEEP_IFB_DEFAULT} ;;
+    esac
+    if [ "${NSS_KEEP_IFB}" -eq 1 ]; then
+        DELETENSSIFB=
+        sqm_debug "${NSS_IFB} will not be deleted on stop (nss_keep_ifb=1)"
+    else
+        DELETENSSIFB=1
+        sqm_debug "${NSS_IFB} will be deleted on stop and recreated on start (nss_keep_ifb=0)"
+    fi
+    return 0
+}
+
 nss_init_config() {
     nss_uci_load
 
@@ -153,11 +194,18 @@ nss_init_config() {
     nss_opt NSS_WAN_TIMEOUT    nss_wan_timeout    20
     nss_opt NSS_WAN_REQUIRED   nss_wan_required   0
     nss_opt NSS_START_ATTEMPTS nss_start_attempts 3
+    nss_opt NSS_RELOAD_AUTORATE nss_reload_autorate 1
+    nss_apply_keep_ifb
 
     nss_is_uint "${NSS_WAIT_TIMEOUT}"   || NSS_WAIT_TIMEOUT=30
     nss_is_uint "${NSS_WAN_TIMEOUT}"    || NSS_WAN_TIMEOUT=20
     nss_is_uint "${NSS_WAN_REQUIRED}"   || NSS_WAN_REQUIRED=0
     nss_is_uint "${NSS_START_ATTEMPTS}" || NSS_START_ATTEMPTS=3
+    case "${NSS_RELOAD_AUTORATE}" in
+        0|1) ;;
+        *) sqm_warn "nss_reload_autorate '${NSS_RELOAD_AUTORATE}' is not 0 or 1, using the default (1)"
+           NSS_RELOAD_AUTORATE=1 ;;
+    esac
     [ "${NSS_START_ATTEMPTS}" -ge 1 ]   || NSS_START_ATTEMPTS=1
     if [ -n "${ROOT_BURST_UP}" ] && { ! nss_is_uint "${ROOT_BURST_UP}" || [ "${ROOT_BURST_UP}" -eq 0 ]; }; then
         sqm_warn "root_burst_up '${ROOT_BURST_UP}' is not a positive number of bytes, ignoring it"
@@ -466,7 +514,7 @@ nss_ifb_teardown() {
         SILENT=1 $IP link delete dev "${NSS_IFB}" type nss_ifb
         sqm_debug "${NSS_IFB} interface deleted"
     else
-        sqm_debug "not deleting ${NSS_IFB} (kernel 5.10 workaround)"
+        sqm_debug "not deleting ${NSS_IFB} (nss_keep_ifb)"
     fi
     return 0
 }
@@ -547,6 +595,54 @@ nss_start_once() {
     return 0
 }
 
+###############################################################################
+# sqm-autorate
+#
+# A start (and so every restart) of this script resets the shapers to the
+# static rates and bursts of the SQM config. sqm-autorate only talks to tc when
+# its own rate changes, so after a restart it would keep running on the wrong
+# values. A SIGHUP ("reload") makes it re-apply everything immediately.
+#
+# Nothing here can fail a start and nothing needs the user:
+#   * autorate not installed (no init script)        -> skipped
+#   * installed but not running (stopped, disabled,
+#     crashed, SQM start at boot before it)          -> skipped, NEVER started
+#   * running (however it was started)               -> reload
+#   * reload fails or hangs                          -> warning, start goes on
+###############################################################################
+nss_autorate_reload() {
+    local init="${NSS_AUTORATE_INIT}" out rc
+
+    [ "${NSS_RELOAD_AUTORATE:-1}" -eq 1 ] || return 0
+
+    if [ ! -f "${init}" ] || [ ! -x "${init}" ]; then
+        sqm_debug "sqm-autorate is not installed, nothing to reload"
+        return 0
+    fi
+    if ! "${init}" status >/dev/null 2>&1; then
+        sqm_debug "sqm-autorate is not running, nothing to reload"
+        return 0
+    fi
+
+    # let the NSS side settle after the shapers were attached (same idea as the
+    # sleep before nssifb is brought up)
+    sleep 1
+
+    # a hung init script must never block the SQM start (which holds the run lock)
+    if nss_have timeout && timeout 5 true >/dev/null 2>&1; then
+        out=$(timeout 10 "${init}" reload 2>&1)
+    else
+        out=$("${init}" reload 2>&1)
+    fi
+    rc=$?
+    if [ "${rc}" -eq 0 ]; then
+        sqm_log "sqm-autorate is running, asked it to reload so it re-applies its rates"
+    else
+        sqm_warn "could not reload sqm-autorate (rc ${rc}): ${out}"
+    fi
+    return 0
+}
+
 # We override the stock sqm_start: it calls verify_qdisc, which creates and
 # destroys ifb devices and knows nothing about the NSS qdiscs.
 sqm_start() {
@@ -561,6 +657,7 @@ sqm_start() {
 
     while :; do
         if nss_start_once; then
+            nss_autorate_reload
             return 0
         fi
         nss_rollback
@@ -576,6 +673,9 @@ sqm_start() {
 
 # Custom stop: the standard function would delete an ifb of the wrong type.
 sqm_stop() {
+    # stop-sqm never runs sqm_start, so read the options that matter here too
+    nss_uci_load
+    nss_apply_keep_ifb
     SILENT=1 $TC qdisc del dev "${NSS_DEV}" root
     nss_ifb_teardown
     nss_have nft_cleanup && nft_cleanup
