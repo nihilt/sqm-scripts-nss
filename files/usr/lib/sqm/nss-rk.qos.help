@@ -1,4 +1,5 @@
-Experimental HW-accelerated traffic shaping support for NSS-enabled platforms. 
-Needs the QCA nss-ifb kernel module to work correctly. 
-Only works with eth0/eth1 and the fq_codel queue discipline.
-Does not support ECN, classification and DSCP options at the moment. 
+Hardware-accelerated traffic shaping for NSS platforms: nsstbl and nssfq_codel run on the NSS cores.
+Needs the NSS qdisc modules, nss-ifb and a tc that knows the NSS qdiscs.
+Choose fq_codel as the queue discipline and the physical eth device that carries the WAN traffic as the interface (eth0 on the R7800).
+Optional upload classes: nss_dscp_classes 1 splits the upload into high, normal and bulk queues by DSCP (nss_dscp_high, nss_dscp_bulk) and by static rules on protocol, address and port (nss_dscp_match). Download is one queue.
+ECN marking, squash_dscp and the link layer options have no effect.
