@@ -39,7 +39,7 @@ The NSS qdisc modules this script needs (`nsstbl`, `nssfq_codel`, and `nssprio` 
 
 ## Requirements
 
-* An OpenWrt build with the NSS qdisc support: the `qca-nss-qdisc` and `nss-ifb` kernel modules and the NSS-patched `tc`. The stock `tc-full` or `tc-bpf` do not know the NSS qdiscs; if one of them replaced the patched `tc`, the script refuses to start and the log says `Unknown qdisc nsstbl`.
+* An OpenWrt build with NSS qdisc support: the `qca-nss-qdisc` and `nss-ifb` kernel modules and a `tc` that knows the NSS qdiscs (`nsstbl`, `nssfq_codel`, `nssprio`). The recommended builds carry the NSS patches in their iproute2 and their R7800 configuration selects `tc-full`; sqm-autorate-nss uses the same `tc`. A `tc` built without those patches, for example a package from the official OpenWrt repository, does not know the NSS qdiscs: the script then refuses to start and the log says `Unknown qdisc nsstbl`. The package itself only depends on `sqm-scripts` and `jsonfilter`; `sqm-scripts` in turn needs a `tc` of any variant, so which variant provides the NSS support is decided by your build.
 * `sqm-scripts` and `jsonfilter` (the package depends on them). `luci-app-sqm` is optional and gives you the web interface.
 * `nft` (nftables), only for the optional upload classes.
 
@@ -245,24 +245,87 @@ The patched `sqm-autorate.pl` of [sqm-autorate-nss](https://github.com/nihilt/sq
 Values from [`configs/sqm`](configs/sqm), a Netgear R7800 on a DSA build with an 830 Mbit/s down and 80 Mbit/s up line:
 
     config queue 'eth1'
-        option enabled '1'
-        option interface 'eth0'
-        option download '830000'
-        option upload '80000'
-        option qdisc 'fq_codel'
-        option script 'nss-rk.qos'
-        option eqdisc_opts 'limit 350 flows 1024 quantum 304 target 3.5ms interval 50ms'
-        option iqdisc_opts 'limit 3600 flows 1024 quantum 768 target 3.5ms interval 50ms'
-        option nss_dscp_classes '1'
+    option enabled '1'
+    option interface 'eth0'
+    option debug_logging '0'
+    option upload '80000'
+    option download '830000'
+    option qdisc 'fq_codel'
+    option script 'nss-rk.qos'
+    option qdisc_advanced '1'
+    option qdisc_really_really_advanced '1'
+    option eqdisc_opts 'limit 350 flows 1024 quantum 304 target 3.5ms interval 50ms'
+    option iqdisc_opts 'limit 3600 flows 1024 quantum 768 target 3.5ms interval 50ms'
+    option squash_dscp '0'
+    option ingress_ecn 'NOECN'
+    option nss_dscp_classes '1'
+    option nss_dscp_high 'cs4 cs5 cs6 cs7 ef va'
+    option nss_dscp_bulk 'cs1 le'
+    option nss_dscp_sched 'nssprio'
+    list nss_dscp_match 'high udp dport 500,3478,4500,19302-19309'
 
 The interval and target are shorter than the defaults (100 ms and 5 ms), so codel reacts sooner. A small `quantum` makes the scheduler serve small packets such as calls and games sooner relative to bulk transfers. The limits follow the speed of each direction. Treat the numbers as a starting point and measure on your own line.
 
 ## What has been tested
 
-On a Netgear R7800 (DSA, kernel 6.18, NSS firmware NSS.AK.11.2-9-002-R), IPv4, `nssprio`, 80 Mbit/s upload:
+Everything below ran on a Netgear R7800 (DSA, kernel 6.18, NSS firmware NSS.AK.11.2-9-002-R) with a phone on Wi-Fi as the traffic source. All flows were IPv4 and the scheduler was `nssprio`.
 
-* Upload classes by DSCP: TCP flows, and a UDP flow (a WhatsApp call), land in the class their DSCP maps to.
-* Static rules: a TCP rule by port moves a flow without DSCP into the high class, and a rule by address and port into the bulk class; a `normal` rule keeps an EF-marked flow in the normal class; a UDP rule moves a WhatsApp call into the bulk class; an ICMP rule moves pings into the high class; a flow that matches no static rule still follows the DSCP rules.
+### Upload classes by DSCP
+
+One 15 MB TCP upload at a time, upload limit 80 Mbit/s. The router marked each flow by its source port, so the DSCP did not depend on the phone. The last column is how many bytes each class queue carried during that run (`tc -s qdisc show dev eth0`).
+
+| Flow | DSCP | In the default lists | Queue that carried it |
+|---|---|---|---|
+| high | EF | high | `11:` (high), +15.78 MB |
+| bulk | CS1 | bulk | `13:` (bulk), +15.78 MB |
+| AF21 | AF21 | neither | `12:` (normal), +16.13 MB |
+| normal | none | n/a | `12:` (normal), +15.89 MB |
+
+For each marked flow the nft rules saw only the first 6 packets; after that the firmware had taken the flow over and the queue counters carried the rest. The AF21 flow was marked like the others, but AF21 is in neither list, so it matched no rule and stayed in the normal class: a DSCP that is in no list is left alone.
+
+ICMP is not accelerated, so every packet is tagged and queued by itself. Pings sent from a LAN device with `ping -Q 0x20` (CS1) went into the bulk class: the CS1 rule counted 20 packets of 84 bytes, and `13:` carried the same 20 packets (102 bytes each, with the Ethernet and NSS headers).
+
+### Race between the classes
+
+With the limit at 80 Mbit/s three uploads from a phone do not compete (all three were done within 6.8 s), so this is not a priority test. For the race the upload limit was set to 15 Mbit/s, with sqm-autorate off. Three 15 MB uploads, one per class, were started one second apart in the order that is worst for the priorities: bulk first, then normal, then high.
+
+| Class | Started | Finished | Took | Dropped by CoDel |
+|---|---|---|---|---|
+| high | +2 s | +12.7 s | 10.7 s | 63 |
+| normal | +1 s | +20.4 s | 19.4 s | 155 |
+| bulk | +0 s | +27.1 s | 27.1 s | 226 |
+
+The flows finished in the opposite order to the one they started in. The 45 MB went through in 27 s, about 13 Mbit/s of the 15: the lower classes were slowed down, not starved.
+
+### Schedulers
+
+The same race, on a 15 Mbit/s limit with 15 MB per class and the same start order, once with each scheduler (one run each; the numbers are how long each upload took):
+
+| `nss_dscp_sched` | high | normal | bulk |
+|---|---|---|---|
+| `nssprio` | 11.7 s | 19.9 s | 30.6 s |
+| `nsswrr`, weights `4 2 1` | 18.9 s | 25.7 s | 29.7 s |
+| `nsswfq`, weights `4 2 1` | 18.8 s | 27.9 s | 31.0 s |
+
+Each class carried its own flow with all three schedulers. `nssprio` was best for the high and the normal class. The bulk upload took about 30 s with all three, because the last upload ends when the total has been sent, so `nssprio` does not starve it. `nsswrr` and `nsswfq` gave the same result within the noise.
+
+### Static rules
+
+Rules were set one at a time, with the upload limit at 80 Mbit/s:
+
+| Rule | Traffic | Result |
+|---|---|---|
+| `high tcp sport 50140-50149` | 15 MB upload without DSCP | `11:` carried 15.78 MB |
+| `normal tcp sport 50110-50119` | 15 MB upload marked EF | stayed in `12:`; `11:` got nothing |
+| `bulk saddr <phone> tcp sport 50140-50149` | 15 MB upload | `13:` carried 15.78 MB |
+| same rule, flow on another port, marked EF | 15 MB upload | rule did not match, the DSCP rules put it in `11:` |
+| `bulk udp saddr <phone> dport 443` | QUIC (HTTP/3) requests | the rule counted 29 packets; `13:` carried 162 packets (0.08 MB) |
+| `bulk udp saddr <phone>` | WhatsApp call, about 2 minutes | `13:` carried 7.73 MB |
+| `high icmp daddr 9.9.9.9` | 130 pings of 1400 bytes | the rule counted all 130; `11:` carried them |
+| `high udp dport 500,3478,4500,19302-19309` (no address) | video call from a phone on Wi-Fi, three UDP flows to port 3478 | the rule counted 71 packets; during the call `11:` carried 1.35 Mbit/s and `12:` 0.02 Mbit/s. The call carried no DSCP (a capture of the first packets of new flows saw no marked TCP or UDP packet), so only the rule put it in the high class |
+
+Without any static rule, a WhatsApp call over Wi-Fi was already steered into the high class by the DSCP rules: `11:` went from 45 to 1176 packets (about 210 KB) during the call.
+
 * **Not tested on the router:** IPv6 rules (only checked for syntax), PPPoE, and static rules for `esp`, `gre` and `sctp`.
 
 ## Limitations
