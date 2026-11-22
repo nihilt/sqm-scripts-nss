@@ -1,6 +1,6 @@
 ###############################################################################
 # nss-rk.qos (HW accelerated simple traffic shaper for Qualcomm NSS)
-# version 20261109.2-hardened
+# version 20261120.2-dscp
 #
 # sqm-scripts queue script that shapes with the NSS offloaded nsstbl (token
 # bucket) + nssfq_codel (fq_codel) qdiscs, so shaped traffic stays on the NSS
@@ -41,6 +41,10 @@
 #     file it expects, also for VLAN style names such as eth0.2.
 #   * Burst bytes are taken from the sqm section of THIS interface instead of
 #     "@queue[0]". POSIX sh only, no "[[", "let" or recursion.
+#   * Optional DSCP classes for the UPLOAD direction (nss_dscp_classes, off by
+#     default, see below), optionally steered by static rules on ports,
+#     addresses and protocols (nss_dscp_match). With them off this script builds
+#     exactly the same shaper as before.
 #
 # Optional options in the sqm queue section (/etc/config/sqm), all optional:
 #
@@ -65,6 +69,97 @@
 #                                        is not installed or not running and
 #                                        never starts it. 0: do not touch it.
 #
+# DSCP classes (upload only; download is unchanged). Off by default.
+#
+#   option nss_dscp_classes    '0'       1: build three priority classes on the
+#                                        upload shaper instead of one queue:
+#                                          11: high   (nssprio band 1)
+#                                          12: normal (band 2, the default)
+#                                          13: bulk   (band 3)
+#                                        and tag forwarded packets towards the
+#                                        WAN by their DSCP so the NSS firmware
+#                                        queues them in the matching class.
+#   option nss_dscp_high       'cs4 cs5 cs6 cs7 ef va'
+#                                        DSCP names or numbers (1-63) for the
+#                                        high class (the cake diffserv3 voice
+#                                        set). Names: cs1-cs7, af11-af43, ef,
+#                                        va, le. 'none' for an empty class.
+#   option nss_dscp_bulk       'cs1 le'  same, for the bulk class. A DSCP that is
+#                                        in both lists stays in the high class.
+#   option nss_dscp_wan_dev    ''        device the tag rules match as outgoing
+#                                        interface. Default: the l3 device of
+#                                        the logical interface nss_wan_iface
+#                                        (wan on a DSA build, pppoe-wan on
+#                                        PPPoE). Set it when that cannot be
+#                                        determined.
+#   option nss_dscp_sched      'nssprio' EXPERIMENTAL (nssprio is the proven one):
+#                                        the NSS scheduler that shares the upload
+#                                        between the three classes
+#                                          nssprio  priority bands
+#                                          nsswrr   weighted round robin (quantum
+#                                                   in packets)
+#                                          nsswfq   weighted fair queueing
+#                                                   (quantum in bytes)
+#                                        nsshtb is not offered: the 11.2 firmware
+#                                        refuses its second class (nssq-probe.sh).
+#                                        Run nssq-probe.sh first: it shows which of
+#                                        them your firmware accepts. When the tree
+#                                        cannot be built the script logs a warning
+#                                        and builds nssprio, and when that fails
+#                                        too the single queue.
+#   option nss_dscp_weights    '4 2 1'   shares of high, normal and bulk: three
+#                                        whole numbers 1-1000 (nsswrr and nsswfq;
+#                                        nssprio ignores them)
+#   option nss_dscp_match      ''        static rules by protocol, address and port.
+#                                        They are checked BEFORE the DSCP lists and
+#                                        the first rule that matches decides. A rule:
+#                                          CLASS [PROTO] [saddr A] [daddr A] [sport P] [dport P]
+#                                        CLASS: high, normal (stays in the normal
+#                                        class whatever the DSCP says) or bulk.
+#                                        PROTO: tcp, udp, icmp (IPv4 and IPv6), esp,
+#                                        gre or sctp, or a comma list of them; with a
+#                                        port and no PROTO it is tcp and udp.
+#                                        A: comma list of addresses or prefixes of
+#                                        ONE IP version (192.168.1.20, 10.0.0.0/8,
+#                                        2001:db8::/32); saddr is the LAN side of the
+#                                        flow. P: comma list of ports or ranges
+#                                        (443, 50000-50100).
+#                                        Several rules: a uci "list", or one option
+#                                        with the rules separated by ";" or lines.
+#                                          high udp dport 3478,19302-19309
+#                                          bulk saddr 192.168.1.50
+#                                          normal tcp dport 443 daddr 203.0.113.0/24
+#                                        At most 32 rules, 16 values per list. A rule
+#                                        that is not valid is ignored with a warning.
+#                                        Needs nss_dscp_classes 1.
+#
+#   Everything else (DSCP 0 and all other values) goes to the normal class, as
+#   does traffic nobody tagged. The classes are ordered by priority but the
+#   NSS firmware does not starve the lower ones. The tag rules live in the nft
+#   table "nss_dscp", which is created when SQM starts and removed when it
+#   stops. Notes:
+#     * the tag of a flow is read from its first packets; a flow keeps its
+#       class for its whole life, also when the DSCP of later packets changes,
+#       and connections that were already running when SQM (re)started stay in
+#       the normal class until they are reopened. The same goes for the static
+#       rules; they only see the first packets of a flow;
+#     * only traffic that is forwarded (LAN to WAN) is tagged, not traffic of
+#       the router itself;
+#     * if the classes cannot be built (no nssprio support in tc or kernel) the
+#       script logs a warning and builds the single queue as without this option;
+#     * sqm-autorate: the patched sqm-autorate.pl (qdisc_stats nsstbl, no leaf
+#       changes when an nssprio is present) works with this; older versions
+#       read the wrong counters. It only knows nssprio: with nsswrr or nsswfq
+#       stop it while you test (its leaf change would fail);
+#     * if nft refuses the static rules the DSCP rules are loaded without them
+#       (warning in the log); nothing is tagged only when nft refuses those too.
+#       Which of them are loaded: nft list table inet nss_dscp (every rule has
+#       a counter);
+#     * the nft rules are also written to ${SQM_STATE_DIR}/<iface>.nss-dscp.nft,
+#       with @WAN@ in place of the WAN device. The optional hotplug helper
+#       12-sqm-nss loads that file again when the WAN comes up with another
+#       device name or the table is gone. Nothing is restarted for that.
+#
 # The same names in upper case (NSS_WAN_IFACE, ...) work as environment
 # variables and take precedence.
 ################################################################################
@@ -86,6 +181,29 @@ SYSFS=${NSS_SYSFS:-/sys}
 
 # init script of sqm-autorate (nihilt/sqm-autorate-nss), see nss_autorate_reload
 NSS_AUTORATE_INIT=${NSS_AUTORATE_INIT:-/etc/init.d/sqm-autorate}
+
+# nft table with the tag rules of the DSCP classes (nss_dscp_classes)
+NSS_DSCP_TABLE=${NSS_DSCP_TABLE:-nss_dscp}
+# nft binary and the defaults of the two class lists
+NSS_NFT=${NSS_NFT:-nft}
+NSS_DSCP_HIGH_DEFAULT="cs4 cs5 cs6 cs7 ef va"
+NSS_DSCP_BULK_DEFAULT="cs1 le"
+NSS_DSCP_SCHED_DEFAULT=nssprio
+NSS_DSCP_WEIGHTS_DEFAULT="4 2 1"
+# most static rules (nss_dscp_match) and values per address or port list
+NSS_DSCP_MATCH_MAX=32
+NSS_DSCP_LIST_MAX=16
+# set by nss_dscp_init / nss_shape_dev
+NSS_DSCP_ACTIVE=0
+# the static rules, one per line: "CLASS nft-match", and how many
+NSS_DSCP_STATIC=
+NSS_DSCP_STATIC_N=0
+
+# file the nft rules are also written to (@WAN@ stands for the WAN device);
+# 12-sqm-nss reads it
+nss_dscp_rules_file() {
+    printf '%s' "${NSS_DSCP_RULES:-${SQM_STATE_DIR}/${IFACE}.nss-dscp.nft}"
+}
 
 # NSS only works on physical eth devices. Some platforms put the WAN on a
 # vlan sub interface (eth0.2): just strip the vlan id for the tc commands.
@@ -184,6 +302,408 @@ nss_apply_keep_ifb() {
     return 0
 }
 
+###############################################################################
+# DSCP classes (nss_dscp_classes)
+###############################################################################
+
+# DSCP name or number 1..63 -> number on stdout. DSCP 0 (cs0, best effort) is
+# refused: it is what the normal class is for. rc 1: not valid.
+nss_dscp_num() {
+    case "$1" in
+        cs1) echo 8 ;;  cs2) echo 16 ;; cs3) echo 24 ;; cs4) echo 32 ;;
+        cs5) echo 40 ;; cs6) echo 48 ;; cs7) echo 56 ;;
+        af11) echo 10 ;; af12) echo 12 ;; af13) echo 14 ;;
+        af21) echo 18 ;; af22) echo 20 ;; af23) echo 22 ;;
+        af31) echo 26 ;; af32) echo 28 ;; af33) echo 30 ;;
+        af41) echo 34 ;; af42) echo 36 ;; af43) echo 38 ;;
+        ef) echo 46 ;; va) echo 44 ;; le) echo 1 ;;
+        0*) return 1 ;;
+        [1-9]|[1-9][0-9])
+            [ "$1" -le 63 ] || return 1
+            echo "$1" ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# nss_dscp_parse OPTION_NAME "LIST" EXCLUDE_CSV
+# LIST: DSCP names/numbers separated by spaces (or commas). Result in
+# NSS_DSCP_PARSED as "n,n,n" (empty when nothing valid). Numbers listed in
+# EXCLUDE_CSV are dropped (they belong to an earlier class). Anything but
+# letters, digits, spaces and commas rejects the whole list, so nothing odd can
+# ever reach the nft command.
+nss_dscp_parse() {
+    local what="$1" list="$2" excl="$3" tok n out=
+
+    NSS_DSCP_PARSED=
+    list=$(printf '%s' "${list}" | tr 'A-Z,' 'a-z ')
+    case "${list}" in
+        *[!a-z0-9\ ]*)
+            sqm_warn "${what}: only letters, digits, spaces and commas are allowed, ignoring the whole list"
+            return 0 ;;
+    esac
+
+    # shellcheck disable=SC2086  # word splitting wanted; the characters were checked above
+    for tok in ${list}; do
+        [ "${tok}" = none ] && continue
+        if ! n=$(nss_dscp_num "${tok}"); then
+            sqm_warn "${what}: '${tok}' is not a DSCP name or a number from 1 to 63, ignored"
+            continue
+        fi
+        case ",${excl}," in
+            *",${n},"*)
+                sqm_warn "${what}: DSCP ${n} (${tok}) is already in the high class, ignored"
+                continue ;;
+        esac
+        case ",${out}," in
+            *",${n},"*) continue ;;
+        esac
+        out="${out:+${out},}${n}"
+    done
+    NSS_DSCP_PARSED=${out}
+    return 0
+}
+
+# nss_dscp_weights_parse: NSS_DSCP_WEIGHTS is three whole numbers 1-1000 (high,
+# normal, bulk); sets NSS_W_HIGH / NSS_W_NORM / NSS_W_BULK. rc 1: not valid.
+nss_dscp_weights_parse() {
+    local n
+
+    # digits and spaces only: nothing to glob or expand in the split below
+    case "${NSS_DSCP_WEIGHTS}" in *[!0-9\ ]*) return 1 ;; esac
+    # shellcheck disable=SC2086  # the list is intentionally word split
+    set -- ${NSS_DSCP_WEIGHTS}
+    [ $# -eq 3 ] || return 1
+    for n in "$@"; do
+        nss_is_uint "${n}" || return 1
+        case "${n}" in 0*) return 1 ;; esac
+        [ "${#n}" -le 4 ] && [ "${n}" -le 1000 ] || return 1
+    done
+    NSS_W_HIGH=$1; NSS_W_NORM=$2; NSS_W_BULK=$3
+    return 0
+}
+
+# ---- static rules (nss_dscp_match) -----------------------------------------
+# The option is cut into words and checked word by word; only forms that nft
+# is known to take are accepted, and everything that reaches the nft script is
+# made of the characters a-z 0-9 . : , / - and spaces.
+
+# nss_m_reset: forget the rule that was being read
+nss_m_reset() {
+    NSS_M_CLS=; NSS_M_PROTO=; NSS_M_PORTOK=1; NSS_M_FAM=
+    NSS_M_SADDR=; NSS_M_DADDR=; NSS_M_SPORT=; NSS_M_DPORT=
+    NSS_M_WANT=; NSS_M_ERR=; NSS_M_TEXT=
+}
+
+# one port: 1-65535, no sign, no leading zero
+nss_m_port() {
+    case "$1" in ''|0*|*[!0-9]*) return 1 ;; esac
+    [ "${#1}" -le 5 ] && [ "$1" -le 65535 ]
+}
+
+# nss_m_ports "80,443,50000-50100" -> NSS_M_OUT "80, 443, 50000-50100"
+nss_m_ports() {
+    local e lo hi out=
+
+    NSS_M_OUT=
+    # shellcheck disable=SC2046  # only digits, "-" and "," can be here
+    set -- $(printf '%s' "$1" | tr ',' ' ')
+    [ $# -ge 1 ] && [ $# -le "${NSS_DSCP_LIST_MAX}" ] || return 1
+    for e in "$@"; do
+        case "${e}" in
+            *-*) lo=${e%%-*}; hi=${e#*-} ;;
+            *)   lo=${e}; hi=${e} ;;
+        esac
+        nss_m_port "${lo}" && nss_m_port "${hi}" || return 1
+        [ "${lo}" -le "${hi}" ] || return 1
+        [ "${lo}" -eq "${hi}" ] && e=${lo}
+        out="${out:+${out}, }${e}"
+    done
+    NSS_M_OUT=${out}
+    return 0
+}
+
+# a.b.c.d or a.b.c.d/n
+nss_m_v4() {
+    local IFS=. a="$1" p= o
+
+    case "${a}" in
+        */*) p=${a#*/}; a=${a%%/*}
+             case "${p}" in ''|0?*|*[!0-9]*) return 1 ;; esac
+             [ "${#p}" -le 2 ] && [ "${p}" -le 32 ] || return 1 ;;
+    esac
+    case "${a}" in ''|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+    # shellcheck disable=SC2086  # only digits and dots can be here
+    set -- ${a}
+    [ $# -eq 4 ] || return 1
+    for o in "$@"; do
+        case "${o}" in ''|0?*) return 1 ;; esac
+        [ "${#o}" -le 3 ] && [ "${o}" -le 255 ] || return 1
+    done
+    return 0
+}
+
+# IPv6 address or prefix, lower case hex groups, "::" at most once, no dotted
+# IPv4 tail
+nss_m_v6() {
+    local IFS=: a="$1" p= pre post dbl=0 g
+
+    case "${a}" in
+        */*) p=${a#*/}; a=${a%%/*}
+             case "${p}" in ''|0?*|*[!0-9]*) return 1 ;; esac
+             [ "${#p}" -le 3 ] && [ "${p}" -le 128 ] || return 1 ;;
+    esac
+    case "${a}" in ''|*[!0-9a-f:]*|*:::*) return 1 ;; esac
+    case "${a}" in
+        *::*) pre=${a%%::*}; post=${a#*::}
+              case "${post}" in *::*) return 1 ;; esac
+              dbl=1 ;;
+        *)    pre=${a}; post= ;;
+    esac
+    # a single colon at an end is not "::"
+    case "${pre}" in :*|*:) return 1 ;; esac
+    case "${post}" in :*|*:) return 1 ;; esac
+    # shellcheck disable=SC2086  # only hex digits and colons can be here
+    set -- ${pre} ${post}
+    for g in "$@"; do
+        [ "${#g}" -le 4 ] || return 1
+    done
+    if [ "${dbl}" -eq 1 ]; then
+        [ $# -le 7 ]
+    else
+        [ $# -eq 8 ]
+    fi
+}
+
+# nss_m_addrs "LIST": addresses or prefixes of one IP version
+# -> NSS_M_OUT "a, b" and NSS_M_AF (ip or ip6)
+nss_m_addrs() {
+    local e out= af= v
+
+    NSS_M_OUT=; NSS_M_AF=
+    # shellcheck disable=SC2046  # only a-z 0-9 . : / - and "," can be here
+    set -- $(printf '%s' "$1" | tr ',' ' ')
+    [ $# -ge 1 ] && [ $# -le "${NSS_DSCP_LIST_MAX}" ] || return 1
+    for e in "$@"; do
+        case "${e}" in
+            *:*) nss_m_v6 "${e}" || return 1; v=ip6 ;;
+            *)   nss_m_v4 "${e}" || return 1; v=ip ;;
+        esac
+        [ -z "${af}" ] || [ "${af}" = "${v}" ] || return 1
+        af=${v}
+        out="${out:+${out}, }${e}"
+    done
+    NSS_M_OUT=${out}; NSS_M_AF=${af}
+    return 0
+}
+
+# nss_m_proto "tcp,udp" -> NSS_M_PROTO "6, 17" (protocol numbers); NSS_M_PORTOK
+# is 0 when something else than tcp and udp is in it
+nss_m_proto() {
+    local p q n out=
+
+    NSS_M_PROTO=; NSS_M_PORTOK=1
+    # shellcheck disable=SC2046  # only a-z and "," can be here
+    set -- $(printf '%s' "$1" | tr ',' ' ')
+    [ $# -ge 1 ] && [ $# -le 6 ] || return 1
+    for p in "$@"; do
+        case "${p}" in
+            tcp)  n=6 ;;
+            udp)  n=17 ;;
+            icmp) n="1 58"; NSS_M_PORTOK=0 ;;
+            esp)  n=50;  NSS_M_PORTOK=0 ;;
+            gre)  n=47;  NSS_M_PORTOK=0 ;;
+            sctp) n=132; NSS_M_PORTOK=0 ;;
+            *) return 1 ;;
+        esac
+        for q in ${n}; do
+            case ", ${out}, " in
+                *", ${q}, "*) ;;
+                *) out="${out:+${out}, }${q}" ;;
+            esac
+        done
+    done
+    NSS_M_PROTO=${out}
+    return 0
+}
+
+# is the keyword $1 (saddr daddr sport dport) already set in this rule?
+nss_m_have() {
+    case "$1" in
+        saddr) [ -n "${NSS_M_SADDR}" ] ;;
+        daddr) [ -n "${NSS_M_DADDR}" ] ;;
+        sport) [ -n "${NSS_M_SPORT}" ] ;;
+        *)     [ -n "${NSS_M_DPORT}" ] ;;
+    esac
+}
+
+# nss_m_value KEYWORD WORD: the value of saddr, daddr, sport or dport
+nss_m_value() {
+    case "$1" in
+        saddr|daddr)
+            if ! nss_m_addrs "$2"; then
+                NSS_M_ERR="'$2' is not a list of IPv4 or IPv6 addresses or prefixes (one version per list, at most ${NSS_DSCP_LIST_MAX})"
+                return 0
+            fi
+            if [ -n "${NSS_M_FAM}" ] && [ "${NSS_M_FAM}" != "${NSS_M_AF}" ]; then
+                NSS_M_ERR="saddr and daddr must be of the same IP version"
+                return 0
+            fi
+            NSS_M_FAM=${NSS_M_AF}
+            if [ "$1" = saddr ]; then NSS_M_SADDR=${NSS_M_OUT}; else NSS_M_DADDR=${NSS_M_OUT}; fi ;;
+        *)
+            if ! nss_m_ports "$2"; then
+                NSS_M_ERR="'$2' is not a list of ports 1-65535 or ranges (at most ${NSS_DSCP_LIST_MAX})"
+                return 0
+            fi
+            if [ "$1" = sport ]; then NSS_M_SPORT=${NSS_M_OUT}; else NSS_M_DPORT=${NSS_M_OUT}; fi ;;
+    esac
+    return 0
+}
+
+# the rule that was read so far is complete: check it and add it
+nss_m_finish() {
+    local expr=
+
+    [ -n "${NSS_M_TEXT}" ] || return 0
+    if [ -z "${NSS_M_ERR}" ] && [ -n "${NSS_M_WANT}" ]; then
+        NSS_M_ERR="'${NSS_M_WANT}' needs a value"
+    fi
+    if [ -z "${NSS_M_ERR}" ] && [ -z "${NSS_M_PROTO}${NSS_M_SADDR}${NSS_M_DADDR}${NSS_M_SPORT}${NSS_M_DPORT}" ]; then
+        NSS_M_ERR="no protocol, address or port, that would match everything"
+    fi
+    if [ -z "${NSS_M_ERR}" ] && { [ -n "${NSS_M_SPORT}" ] || [ -n "${NSS_M_DPORT}" ]; }; then
+        if [ -z "${NSS_M_PROTO}" ]; then
+            NSS_M_PROTO="6, 17"
+        elif [ "${NSS_M_PORTOK}" -ne 1 ]; then
+            NSS_M_ERR="ports go with tcp and udp only"
+        fi
+    fi
+    if [ -z "${NSS_M_ERR}" ] && [ "${NSS_DSCP_STATIC_N}" -ge "${NSS_DSCP_MATCH_MAX}" ]; then
+        NSS_M_ERR="more than ${NSS_DSCP_MATCH_MAX} rules"
+    fi
+    if [ -n "${NSS_M_ERR}" ]; then
+        sqm_warn "nss_dscp_match: ignoring '${NSS_M_TEXT}': ${NSS_M_ERR}"
+        return 0
+    fi
+
+    [ -n "${NSS_M_PROTO}" ] && expr="meta l4proto { ${NSS_M_PROTO} }"
+    [ -n "${NSS_M_SADDR}" ] && expr="${expr:+${expr} }${NSS_M_FAM} saddr { ${NSS_M_SADDR} }"
+    [ -n "${NSS_M_DADDR}" ] && expr="${expr:+${expr} }${NSS_M_FAM} daddr { ${NSS_M_DADDR} }"
+    [ -n "${NSS_M_SPORT}" ] && expr="${expr:+${expr} }th sport { ${NSS_M_SPORT} }"
+    [ -n "${NSS_M_DPORT}" ] && expr="${expr:+${expr} }th dport { ${NSS_M_DPORT} }"
+    NSS_DSCP_STATIC="${NSS_DSCP_STATIC:+${NSS_DSCP_STATIC}
+}${NSS_M_CLS} ${expr}"
+    NSS_DSCP_STATIC_N=$((NSS_DSCP_STATIC_N + 1))
+    return 0
+}
+
+# nss_dscp_match_parse: NSS_DSCP_MATCH -> NSS_DSCP_STATIC / NSS_DSCP_STATIC_N.
+# A rule starts at each of the words high, normal and bulk, so the rules can be
+# separated by anything: a uci list (joined by spaces), ";" or new lines.
+nss_dscp_match_parse() {
+    local list tok
+
+    NSS_DSCP_STATIC=
+    NSS_DSCP_STATIC_N=0
+    [ -n "${NSS_DSCP_MATCH}" ] || return 0
+
+    list=$(printf '%s' "${NSS_DSCP_MATCH}" | tr 'A-Z;\n\t\r' 'a-z    ')
+    case "${list}" in
+        *[!a-z0-9\ .:,/-]*)
+            sqm_warn "nss_dscp_match: only letters, digits, spaces and . : , / - ; are allowed, ignoring all static rules"
+            return 0 ;;
+    esac
+
+    nss_m_reset
+    # shellcheck disable=SC2086  # word splitting wanted; the characters were checked above
+    set -- ${list}
+    for tok in "$@"; do
+        case "${tok}" in
+            high|normal|bulk)
+                nss_m_finish
+                nss_m_reset
+                NSS_M_CLS=${tok}; NSS_M_TEXT=${tok}
+                continue ;;
+        esac
+        NSS_M_TEXT="${NSS_M_TEXT:+${NSS_M_TEXT} }${tok}"
+        [ -z "${NSS_M_ERR}" ] || continue
+        if [ -z "${NSS_M_CLS}" ]; then
+            NSS_M_ERR="a rule starts with high, normal or bulk"
+            continue
+        fi
+        if [ -n "${NSS_M_WANT}" ]; then
+            nss_m_value "${NSS_M_WANT}" "${tok}"
+            NSS_M_WANT=
+            continue
+        fi
+        case "${tok}" in
+            saddr|daddr|sport|dport)
+                if nss_m_have "${tok}"; then
+                    NSS_M_ERR="'${tok}' given twice"
+                else
+                    NSS_M_WANT=${tok}
+                fi ;;
+            *)
+                if [ -n "${NSS_M_PROTO}" ]; then
+                    NSS_M_ERR="'${tok}': the protocol is already given"
+                elif ! nss_m_proto "${tok}"; then
+                    NSS_M_ERR="'${tok}' is not tcp, udp, icmp, esp, gre, sctp, saddr, daddr, sport or dport"
+                fi ;;
+        esac
+    done
+    nss_m_finish
+    nss_m_reset
+    sqm_debug "nss_dscp_match_parse: ${NSS_DSCP_STATIC_N} static rule(s)"
+    return 0
+}
+
+# read and validate the nss_dscp_* options. Needs nss_uci_load first.
+nss_dscp_init() {
+    NSS_DSCP_ACTIVE=0
+    NSS_DSCP_HIGH_NUMS=
+    NSS_DSCP_BULK_NUMS=
+    NSS_DSCP_STATIC=
+    NSS_DSCP_STATIC_N=0
+
+    nss_opt NSS_DSCP_CLASSES nss_dscp_classes 0
+    case "${NSS_DSCP_CLASSES}" in
+        0|1) ;;
+        *) sqm_warn "nss_dscp_classes '${NSS_DSCP_CLASSES}' is not 0 or 1, using the default (0)"
+           NSS_DSCP_CLASSES=0 ;;
+    esac
+    [ "${NSS_DSCP_CLASSES}" -eq 1 ] || return 0
+
+    nss_opt NSS_DSCP_HIGH    nss_dscp_high    "${NSS_DSCP_HIGH_DEFAULT}"
+    nss_opt NSS_DSCP_BULK    nss_dscp_bulk    "${NSS_DSCP_BULK_DEFAULT}"
+    nss_opt NSS_DSCP_WAN_DEV nss_dscp_wan_dev ""
+
+    nss_dscp_parse nss_dscp_high "${NSS_DSCP_HIGH}" ""
+    NSS_DSCP_HIGH_NUMS=${NSS_DSCP_PARSED}
+    nss_dscp_parse nss_dscp_bulk "${NSS_DSCP_BULK}" "${NSS_DSCP_HIGH_NUMS}"
+    NSS_DSCP_BULK_NUMS=${NSS_DSCP_PARSED}
+    sqm_debug "nss_dscp_init: high='${NSS_DSCP_HIGH_NUMS}' bulk='${NSS_DSCP_BULK_NUMS}'"
+
+    nss_opt NSS_DSCP_SCHED nss_dscp_sched "${NSS_DSCP_SCHED_DEFAULT}"
+    NSS_DSCP_SCHED=$(printf '%s' "${NSS_DSCP_SCHED}" | tr 'A-Z' 'a-z')
+    case "${NSS_DSCP_SCHED}" in
+        nssprio|nsswrr|nsswfq) ;;
+        *) sqm_warn "nss_dscp_sched '${NSS_DSCP_SCHED}' is not nssprio, nsswrr or nsswfq, using nssprio"
+           NSS_DSCP_SCHED=nssprio ;;
+    esac
+    nss_opt NSS_DSCP_WEIGHTS nss_dscp_weights "${NSS_DSCP_WEIGHTS_DEFAULT}"
+    if ! nss_dscp_weights_parse; then
+        sqm_warn "nss_dscp_weights '${NSS_DSCP_WEIGHTS}' is not three whole numbers 1-1000, using ${NSS_DSCP_WEIGHTS_DEFAULT}"
+        NSS_DSCP_WEIGHTS=${NSS_DSCP_WEIGHTS_DEFAULT}
+        nss_dscp_weights_parse
+    fi
+    sqm_debug "nss_dscp_init: sched ${NSS_DSCP_SCHED}, weights ${NSS_W_HIGH}:${NSS_W_NORM}:${NSS_W_BULK}"
+
+    nss_opt NSS_DSCP_MATCH nss_dscp_match ""
+    nss_dscp_match_parse
+    return 0
+}
+
 nss_init_config() {
     nss_uci_load
 
@@ -235,6 +755,8 @@ nss_init_config() {
         eth[0-9]*) ;;
         *) sqm_warn "'${NSS_DEV}' is not an eth device. The NSS shaper only works on the eth devices (eth0 on the R7800), not on DSA ports such as wan/lan1, bridges or ppp interfaces; select eth0 in the SQM interface setting" ;;
     esac
+
+    nss_dscp_init
     return 0
 }
 
@@ -263,6 +785,26 @@ nss_preflight() {
                 return 1 ;;
         esac
     done
+
+    # the DSCP classes need nssprio as well; without it the feature is dropped,
+    # the shaper itself still starts
+    if [ "${NSS_DSCP_CLASSES:-0}" -eq 1 ]; then
+        out=$("${tcbin}" qdisc add dev lo root handle 1: nssprio help 2>&1)
+        case "${out}" in
+            *"Unknown qdisc"*)
+                sqm_warn "${tcbin} has no support for the NSS qdisc 'nssprio': DSCP classes are disabled"
+                NSS_DSCP_CLASSES=0 ;;
+        esac
+    fi
+    # ... and the scheduler asked for, if it is another one: fall back to nssprio
+    if [ "${NSS_DSCP_CLASSES:-0}" -eq 1 ] && [ "${NSS_DSCP_SCHED:-nssprio}" != nssprio ]; then
+        out=$("${tcbin}" qdisc add dev lo root handle 1: "${NSS_DSCP_SCHED}" help 2>&1)
+        case "${out}" in
+            *"Unknown qdisc"*)
+                sqm_warn "${tcbin} has no support for the NSS qdisc '${NSS_DSCP_SCHED}': using nssprio"
+                NSS_DSCP_SCHED=nssprio ;;
+        esac
+    fi
 
     # kernel side: autoloaded normally, try to load it if it is not
     if [ ! -d "${SYSFS}/module/qca_nss_qdisc" ]; then
@@ -400,13 +942,13 @@ add_nsstbl() {
     return 0
 }
 
-# nssfq_codel child
-# add_nssfq_codel DEV SPEED_KBIT TARGET LIMIT MTU OPTS
-add_nssfq_codel() {
+# arguments of a nssfq_codel leaf, left in NSS_LEAF_ARGS
+# nss_leaf_args DEV SPEED_KBIT TARGET LIMIT MTU OPTS
+nss_leaf_args() {
     local dev="$1" speed="$2" target="$3" limit="$4" mtu="$5" opts="$6"
     local q lim tgt
 
-    sqm_debug "add_nssfq_codel ${dev}: speed:${speed} target:${target} limit:${limit} mtu:${mtu} opts:${opts}"
+    sqm_debug "nss_leaf_args ${dev}: speed:${speed} target:${target} limit:${limit} mtu:${mtu} opts:${opts}"
 
     # codel interval: should be the average worst case latency to your services
     case " ${opts} " in
@@ -439,8 +981,52 @@ add_nssfq_codel() {
         *) tgt=$(get_target "${target}" "${speed}") ;;
     esac
 
+    NSS_LEAF_ARGS="${lim} ${tgt} ${opts}"
+    return 0
+}
+
+# nssfq_codel child
+# add_nssfq_codel DEV SPEED_KBIT TARGET LIMIT MTU OPTS
+add_nssfq_codel() {
+    nss_leaf_args "$@"
     # shellcheck disable=SC2086  # options are intentionally word split
-    $TC qdisc add dev "${dev}" parent 1: handle 10: nssfq_codel ${lim} ${tgt} ${opts} set_default || return 1
+    $TC qdisc add dev "$1" parent 1: handle 10: nssfq_codel ${NSS_LEAF_ARGS} set_default || return 1
+    return 0
+}
+
+# DSCP classes: nsstbl 1: -> a scheduler 10: with three nssfq_codel leaves. The
+# firmware sends a flow to the leaf whose HANDLE equals the flow's tag (11:0 and
+# 13:0 are set by nss_dscp_apply); everything else, untagged traffic included,
+# goes to the set_default leaf 12:.
+#   10:1 -> 11: high    10:2 -> 12: normal (default)    10:3 -> 13: bulk
+# The scheduler is nssprio (three bands) or, opt-in, nsswrr / nsswfq
+# with three classes 10:1-10:3 weighted by nss_dscp_weights.
+# add_nss_classes SCHED DEV SPEED_KBIT TARGET LIMIT MTU OPTS
+add_nss_classes() {
+    local sched="$1" dev w c=1
+
+    shift
+    dev="$1"
+    nss_leaf_args "$@"
+    case "${sched}" in
+        nssprio)
+            $TC qdisc add dev "${dev}" parent 1: handle 10: nssprio bands 3 || return 1 ;;
+        nsswrr|nsswfq)
+            $TC qdisc add dev "${dev}" parent 1: handle 10: "${sched}" || return 1
+            for w in ${NSS_W_HIGH} ${NSS_W_NORM} ${NSS_W_BULK}; do
+                # wrr: quantum in packets; wfq: in bytes
+                [ "${sched}" = nsswfq ] && w=$(( w * 1500 ))
+                $TC class add dev "${dev}" parent 10: classid "10:${c}" "${sched}" quantum "${w}" || return 1
+                c=$(( c + 1 ))
+            done ;;
+        *) return 1 ;;
+    esac
+    # shellcheck disable=SC2086  # options are intentionally word split
+    $TC qdisc add dev "${dev}" parent 10:1 handle 11: nssfq_codel ${NSS_LEAF_ARGS} || return 1
+    # shellcheck disable=SC2086
+    $TC qdisc add dev "${dev}" parent 10:2 handle 12: nssfq_codel ${NSS_LEAF_ARGS} set_default || return 1
+    # shellcheck disable=SC2086
+    $TC qdisc add dev "${dev}" parent 10:3 handle 13: nssfq_codel ${NSS_LEAF_ARGS} || return 1
     return 0
 }
 
@@ -460,10 +1046,10 @@ nss_mtu() {
     echo $(( m + ov ))
 }
 
-# nss_shape_dev DEV SPEED TARGET LIMIT(or empty) OPTS BURST_BYTES(or empty) BURST_US
+# nss_shape_dev DEV SPEED TARGET LIMIT(or empty) OPTS BURST_BYTES(or empty) BURST_US [CLASSES 0|1]
 nss_shape_dev() {
-    local dev="$1" speed="$2" target="$3" limit="$4" opts="$5" rburst="$6" burst_us="$7"
-    local mtu
+    local dev="$1" speed="$2" target="$3" limit="$4" opts="$5" rburst="$6" burst_us="$7" classes="${8:-0}"
+    local mtu info= sched built=
 
     mtu=$(nss_mtu "${dev}")
     [ -z "${limit}" ] && limit=$(calc_limit "${speed}" "${mtu}" "${MAXQLIMIT_MS}")
@@ -472,15 +1058,38 @@ nss_shape_dev() {
     SILENT=1 $TC qdisc del dev "${dev}" root
 
     add_nsstbl "${dev}" "${speed}" "${rburst}" "${burst_us}" "${mtu}" || return 1
-    add_nssfq_codel "${dev}" "${speed}" "${target}" "${limit}" "${mtu}" "${opts}" || return 1
-    sqm_log "NSS shaper on ${dev}: ${speed} kbit/s, burst ${NSS_LAST_BURST} bytes, mtu ${mtu}"
+    if [ "${classes}" -eq 1 ]; then
+        sched=${NSS_DSCP_SCHED:-nssprio}
+        add_nss_classes "${sched}" "${dev}" "${speed}" "${target}" "${limit}" "${mtu}" "${opts}" && built=${sched}
+        if [ -z "${built}" ] && [ "${sched}" != nssprio ]; then
+            # an experimental scheduler that does not build: the proven one next
+            sqm_warn "could not build the ${sched} DSCP classes on ${dev}, trying nssprio"
+            SILENT=1 $TC qdisc del dev "${dev}" root
+            add_nsstbl "${dev}" "${speed}" "${rburst}" "${burst_us}" "${mtu}" || return 1
+            add_nss_classes nssprio "${dev}" "${speed}" "${target}" "${limit}" "${mtu}" "${opts}" && built=nssprio
+        fi
+        if [ -n "${built}" ]; then
+            NSS_DSCP_ACTIVE=1
+            info=", DSCP classes high/normal/bulk"
+            [ "${built}" = nssprio ] || info="${info} (${built} ${NSS_W_HIGH}:${NSS_W_NORM}:${NSS_W_BULK})"
+        else
+            # the classes are an extra: never lose the shaper over them
+            sqm_warn "could not build the DSCP classes on ${dev}, using a single queue instead"
+            SILENT=1 $TC qdisc del dev "${dev}" root
+            add_nsstbl "${dev}" "${speed}" "${rburst}" "${burst_us}" "${mtu}" || return 1
+            add_nssfq_codel "${dev}" "${speed}" "${target}" "${limit}" "${mtu}" "${opts}" || return 1
+        fi
+    else
+        add_nssfq_codel "${dev}" "${speed}" "${target}" "${limit}" "${mtu}" "${opts}" || return 1
+    fi
+    sqm_log "NSS shaper on ${dev}: ${speed} kbit/s, burst ${NSS_LAST_BURST} bytes, mtu ${mtu}${info}"
     return 0
 }
 
 nss_egress() {
     [ -z "${ETARGET}" ] && ETARGET="5ms"
     nss_shape_dev "${NSS_DEV}" "${UPLINK}" "${ETARGET}" "${ELIMIT}" "${EQDISC_OPTS}" \
-        "${ROOT_BURST_UP}" "${ESHAPER_BURST_DUR_US}" || { sqm_error "egress: failed to set up the NSS shaper on ${NSS_DEV}"; return 1; }
+        "${ROOT_BURST_UP}" "${ESHAPER_BURST_DUR_US}" "${NSS_DSCP_CLASSES:-0}" || { sqm_error "egress: failed to set up the NSS shaper on ${NSS_DEV}"; return 1; }
     return 0
 }
 
@@ -495,6 +1104,180 @@ nss_ingress() {
     sleep 1
     sqm_debug "ingress: enabling ${NSS_IFB}.."
     $IP link set up dev "${NSS_IFB}" || { sqm_error "ingress: cannot bring up ${NSS_IFB}"; return 1; }
+    return 0
+}
+
+###############################################################################
+# DSCP tag rules (nft)
+#
+# One chain on the forward hook; packets leaving through the WAN device get
+# skb->priority set to the handle of their class. ECM records that value when
+# it accelerates the flow and the NSS firmware queues the flow in the leaf with
+# that handle. Only the exact handles 11:0 and 13:0 are ever written: a tag that
+# equals a band or class id (10:1 ...) must be avoided.
+###############################################################################
+
+# WAN device name for the oifname match, or nothing
+nss_dscp_wan_dev() {
+    local dev="${NSS_DSCP_WAN_DEV}" json
+
+    if [ -z "${dev}" ]; then
+        case "${NSS_WAN_IFACE}" in
+            ''|none|off|0) return 1 ;;
+        esac
+        nss_have ubus && nss_have jsonfilter || return 1
+        json=$(ubus call "network.interface.${NSS_WAN_IFACE}" status 2>/dev/null) || return 1
+        dev=$(printf '%s' "${json}" | jsonfilter -e '@.l3_device' 2>/dev/null)
+    fi
+    # a plain interface name only: it ends up inside quotes in the nft ruleset
+    case "${dev}" in
+        ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    [ "${#dev}" -le 15 ] || return 1
+    printf '%s' "${dev}"
+}
+
+# the tag rules only (the rules file stays)
+nss_dscp_remove_table() {
+    nss_have "${NSS_NFT}" || return 0
+    "${NSS_NFT}" delete table inet "${NSS_DSCP_TABLE}" >/dev/null 2>&1
+    return 0
+}
+
+# the tag rules and the rules file
+nss_dscp_remove() {
+    local file
+    file=$(nss_dscp_rules_file)
+    rm -f "${file}" "${file}.tmp" 2>/dev/null
+    nss_dscp_remove_table
+    return 0
+}
+
+# statement of an upload rule for class $1 (high|bulk): the tag for the upload
+# shaper; nothing while the classes are not active
+nss_dscp_up_stmt() {
+    local tag
+
+    [ "${NSS_DSCP_ACTIVE}" -eq 1 ] || return 0
+    case "$1" in
+        high) tag=11:0 ;;
+        *)    tag=13:0 ;;
+    esac
+    printf 'meta priority set %s' "${tag}"
+}
+
+# Print the complete nft script, with @WAN@ in place of the WAN device name.
+# The static rules (nss_dscp_match) come first and each ends with "accept", so
+# the first one that matches decides and the DSCP rules below never see that
+# packet ("accept" only ends this chain, other chains and hooks still run).
+# "nostatic" as the argument leaves them out.
+nss_dscp_ruleset() {
+    local fam stmt cls expr
+
+    printf 'add table inet %s\n' "${NSS_DSCP_TABLE}"
+    printf 'delete table inet %s\n' "${NSS_DSCP_TABLE}"
+    printf 'table inet %s {\n' "${NSS_DSCP_TABLE}"
+    printf '\tchain forward_up {\n'
+    printf '\t\ttype filter hook forward priority filter; policy accept;\n'
+    if [ "${1:-}" != nostatic ] && [ -n "${NSS_DSCP_STATIC}" ]; then
+        printf '%s\n' "${NSS_DSCP_STATIC}" | while read -r cls expr; do
+            case "${cls}" in
+                normal) stmt= ;;
+                *) stmt=$(nss_dscp_up_stmt "${cls}")
+                   [ -n "${stmt}" ] || continue
+                   stmt=" ${stmt}" ;;
+            esac
+            printf '\t\toifname "@WAN@" %s counter%s accept\n' "${expr}" "${stmt}"
+        done
+    fi
+    for fam in ip ip6; do
+        if [ -n "${NSS_DSCP_HIGH_NUMS}" ]; then
+            stmt=$(nss_dscp_up_stmt high)
+            [ -n "${stmt}" ] && \
+                printf '\t\toifname "@WAN@" %s dscp { %s } counter %s\n' \
+                    "${fam}" "${NSS_DSCP_HIGH_NUMS}" "${stmt}"
+        fi
+        if [ -n "${NSS_DSCP_BULK_NUMS}" ]; then
+            stmt=$(nss_dscp_up_stmt bulk)
+            [ -n "${stmt}" ] && \
+                printf '\t\toifname "@WAN@" %s dscp { %s } counter %s\n' \
+                    "${fam}" "${NSS_DSCP_BULK_NUMS}" "${stmt}"
+        fi
+    done
+    printf '\t}\n}\n'
+}
+
+# Create the tag rules. Never fails the start: without them every flow simply
+# goes to the normal class, which is what the shaper did before. The rules are
+# also saved in the rules file, so that 12-sqm-nss can load them later when the
+# WAN device is not known yet or changes.
+# nss_dscp_save RULESET: write the rules file (atomically); rc 1: could not
+nss_dscp_save() {
+    local file
+
+    file=$(nss_dscp_rules_file)
+    if [ -d "${file%/*}" ] && printf '%s\n' "$1" > "${file}.tmp" 2>/dev/null \
+       && mv "${file}.tmp" "${file}" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "${file}.tmp" 2>/dev/null
+    sqm_debug "DSCP classes: could not write ${file}"
+    return 1
+}
+
+# nss_dscp_load RULESET DEV: load it into nft; prints nft's messages
+nss_dscp_load() {
+    printf '%s\n' "$1" | sed "s/@WAN@/$2/g" | "${NSS_NFT}" -f - 2>&1
+}
+
+nss_dscp_apply() {
+    local dev ruleset out written=0 note=
+
+    [ "${NSS_DSCP_ACTIVE}" -eq 1 ] || return 0
+    if ! nss_have "${NSS_NFT}"; then
+        sqm_warn "nft not found: DSCP classes exist but no packet is tagged, everything uses the normal class"
+        return 0
+    fi
+    if [ -z "${NSS_DSCP_HIGH_NUMS}" ] && [ -z "${NSS_DSCP_BULK_NUMS}" ] && [ -z "${NSS_DSCP_STATIC}" ]; then
+        sqm_warn "DSCP classes: no valid DSCP selected, everything uses the normal class"
+        return 0
+    fi
+
+    ruleset=$(nss_dscp_ruleset)
+    nss_dscp_save "${ruleset}" && written=1
+
+    if ! dev=$(nss_dscp_wan_dev); then
+        if [ "${written}" -eq 1 ]; then
+            sqm_warn "DSCP classes: cannot determine the WAN device (is '${NSS_WAN_IFACE}' up?), no packet is tagged yet; 12-sqm-nss loads the saved rules when it comes up, or set nss_dscp_wan_dev"
+        else
+            sqm_warn "DSCP classes: cannot determine the WAN device (is '${NSS_WAN_IFACE}' up?), no packet is tagged; set nss_dscp_wan_dev"
+        fi
+        return 0
+    fi
+
+    if ! out=$(nss_dscp_load "${ruleset}" "${dev}"); then
+        # a static rule that nft does not take must not cost the DSCP rules
+        if [ -n "${NSS_DSCP_STATIC}" ] && { [ -n "${NSS_DSCP_HIGH_NUMS}" ] || [ -n "${NSS_DSCP_BULK_NUMS}" ]; }; then
+            sqm_warn "DSCP classes: nft refused the static rules (${out}), loading the DSCP rules without them"
+            NSS_DSCP_STATIC=
+            NSS_DSCP_STATIC_N=0
+            ruleset=$(nss_dscp_ruleset)
+            if [ "${written}" -eq 1 ] && ! nss_dscp_save "${ruleset}"; then
+                rm -f "$(nss_dscp_rules_file)" 2>/dev/null
+            fi
+            out=$(nss_dscp_load "${ruleset}" "${dev}") || {
+                sqm_warn "DSCP classes: could not load the nft rules (${out}), no packet is tagged"
+                nss_dscp_remove
+                return 0
+            }
+        else
+            sqm_warn "DSCP classes: could not load the nft rules (${out}), no packet is tagged"
+            nss_dscp_remove
+            return 0
+        fi
+    fi
+    [ "${NSS_DSCP_STATIC_N}" -gt 0 ] && note=", ${NSS_DSCP_STATIC_N} static rule(s) first"
+    sqm_log "DSCP classes: out via ${dev}, high (11:) DSCP ${NSS_DSCP_HIGH_NUMS:-none}, bulk (13:) DSCP ${NSS_DSCP_BULK_NUMS:-none}${note}"
     return 0
 }
 
@@ -559,6 +1342,7 @@ nss_prepare_ifb() {
 # undo whatever a failed start left behind
 nss_rollback() {
     sqm_debug "rolling back partial NSS shaper setup"
+    nss_dscp_remove
     SILENT=1 $TC qdisc del dev "${NSS_DEV}" root
     nss_ifb_teardown
     return 0
@@ -566,6 +1350,10 @@ nss_rollback() {
 
 # the actual setup, once
 nss_start_once() {
+    NSS_DSCP_ACTIVE=0
+    # no tag rules of an earlier run, whatever happens below
+    nss_dscp_remove
+
     if [ "${UPLINK}" -ne 0 ]; then
         CUR_DIRECTION="egress"
         nss_egress || return 1
@@ -592,6 +1380,12 @@ nss_start_once() {
         sqm_error "verification failed: no NSS shaper on ${NSS_IFB}"
         return 1
     fi
+
+    # the tag rules go in last, once the queues they point to really exist
+    if [ "${NSS_DSCP_CLASSES:-0}" -eq 1 ] && [ "${NSS_DSCP_ACTIVE}" -ne 1 ]; then
+        sqm_debug "DSCP classes requested but not active (egress shaping off or the classes could not be built)"
+    fi
+    nss_dscp_apply
     return 0
 }
 
@@ -676,6 +1470,7 @@ sqm_stop() {
     # stop-sqm never runs sqm_start, so read the options that matter here too
     nss_uci_load
     nss_apply_keep_ifb
+    nss_dscp_remove
     SILENT=1 $TC qdisc del dev "${NSS_DEV}" root
     nss_ifb_teardown
     nss_have nft_cleanup && nft_cleanup
